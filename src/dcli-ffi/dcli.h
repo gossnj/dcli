@@ -145,7 +145,7 @@ bool dcli_manifest_needs_update(const char *data_dir, bool *out_needs_update);
  * Downloads and installs the manifest
  * Returns true on success, false on error
  */
-bool dcli_manifest_download(const char *data_dir);
+bool dcli_manifest_download(const char *data_dir, const char *api_key);
 
 /**
  * Creates a string that can be freed with dcli_string_free

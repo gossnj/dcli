@@ -21,6 +21,12 @@ typedef struct DcliActivityStore DcliActivityStore;
 typedef struct DcliApiClient DcliApiClient;
 
 /**
+ * Progress callback type for sync operations
+ * Parameters: message (const char*), current (uint32_t), total (uint32_t), user_data (void*)
+ */
+typedef void (*ProgressCallback)(const char *message, uint32_t current, uint32_t total, void *user_data);
+
+/**
  * Represents a Crucible stats result from the API
  */
 typedef struct DcliCrucibleStats {
@@ -125,6 +131,17 @@ bool dcli_store_remove_player(struct DcliActivityStore *store, const char *bungi
 bool dcli_store_sync_player(struct DcliActivityStore *store, const char *bungie_name);
 
 /**
+ * Syncs a player's activities from the API by Bungie name with progress callback
+ * Returns true on success, false on error
+ * callback: Progress callback function pointer (can be NULL for no progress)
+ * user_data: User data pointer passed to callback
+ */
+bool dcli_store_sync_player_with_progress(struct DcliActivityStore *store,
+                                          const char *bungie_name,
+                                          ProgressCallback callback,
+                                          void *user_data);
+
+/**
  * Gets Crucible stats from the local database for a character
  * Uses the `all_time` time period
  * Returns true on success, false on error
@@ -145,7 +162,7 @@ bool dcli_manifest_needs_update(const char *data_dir, bool *out_needs_update);
  * Downloads and installs the manifest
  * Returns true on success, false on error
  */
-bool dcli_manifest_download(const char *data_dir);
+bool dcli_manifest_download(const char *data_dir, const char *api_key);
 
 /**
  * Creates a string that can be freed with dcli_string_free

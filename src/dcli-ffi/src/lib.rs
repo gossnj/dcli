@@ -270,8 +270,8 @@ pub struct DcliActivityStore {
 }
 
 /// Progress callback type for sync operations
-/// Parameters: message (const char*), current (u32), total (u32)
-pub type ProgressCallback = extern "C" fn(*const c_char, u32, u32);
+/// Parameters: message (const char*), current (u32), total (u32), user_data (void*)
+pub type ProgressCallback = extern "C" fn(*const c_char, u32, u32, *mut std::ffi::c_void);
 
 /// Creates a new activity store with the given data directory
 /// Returns null on error
@@ -408,10 +408,25 @@ pub extern "C" fn dcli_store_remove_player(
 
 /// Syncs a player's activities from the API by Bungie name
 /// Returns true on success, false on error
+/// Optionally accepts a progress callback for progress updates
 #[no_mangle]
 pub extern "C" fn dcli_store_sync_player(
     store: *mut DcliActivityStore,
     bungie_name: *const c_char,
+) -> bool {
+    dcli_store_sync_player_with_progress(store, bungie_name, None, std::ptr::null_mut())
+}
+
+/// Syncs a player's activities from the API by Bungie name with progress callback
+/// Returns true on success, false on error
+/// callback: Progress callback function pointer (can be null for no progress)
+/// user_data: User data pointer passed to callback
+#[no_mangle]
+pub extern "C" fn dcli_store_sync_player_with_progress(
+    store: *mut DcliActivityStore,
+    bungie_name: *const c_char,
+    callback: Option<ProgressCallback>,
+    user_data: *mut std::ffi::c_void,
 ) -> bool {
     if store.is_null() || bungie_name.is_null() {
         return false;
@@ -429,15 +444,35 @@ pub extern "C" fn dcli_store_sync_player(
         return false;
     }
 
+    // Helper to send progress updates
+    let send_progress = |message: &str, current: u32, total: u32| {
+        if let Some(cb) = callback {
+            if let Ok(c_msg) = CString::new(message) {
+                cb(c_msg.as_ptr(), current, total, user_data);
+            }
+        }
+    };
+
     unsafe {
         let store_ptr = store as *mut DcliActivityStore;
         let runtime = &mut (*store_ptr).runtime;
         let store_ref = &mut (*store_ptr).store;
 
         runtime.block_on(async {
+            eprintln!("🔄 Starting sync for player: {}", name_str);
+            send_progress("Initializing sync...", 0, 100);
+
             match store_ref.sync_player(&player_name).await {
-                Ok(_) => true,
-                Err(_) => false,
+                Ok(_) => {
+                    eprintln!("✅ Successfully synced player: {}", name_str);
+                    send_progress("Sync complete!", 100, 100);
+                    true
+                },
+                Err(e) => {
+                    eprintln!("❌ Failed to sync player {}: {:?}", name_str, e);
+                    send_progress(&format!("Sync failed: {:?}", e), 0, 100);
+                    false
+                }
             }
         })
     }
@@ -585,7 +620,6 @@ pub extern "C" fn dcli_store_get_crucible_stats(
 
 use dcli::apiclient::ApiClient;
 use dcli::response::manifest::ManifestResponse;
-use tokio::io::AsyncWriteExt;
 use std::fs;
 
 /// Manifest info structure returned to Swift
@@ -685,14 +719,22 @@ pub extern "C" fn dcli_manifest_needs_update(
 #[no_mangle]
 pub extern "C" fn dcli_manifest_download(
     data_dir: *const c_char,
+    api_key: *const c_char,
 ) -> bool {
-    if data_dir.is_null() {
+    if data_dir.is_null() || api_key.is_null() {
         return false;
     }
 
     let dir = unsafe {
         match CStr::from_ptr(data_dir).to_str() {
             Ok(s) => PathBuf::from(s),
+            Err(_) => return false,
+        }
+    };
+
+    let key = unsafe {
+        match CStr::from_ptr(api_key).to_str() {
+            Ok(s) => s,
             Err(_) => return false,
         }
     };
@@ -709,60 +751,94 @@ pub extern "C" fn dcli_manifest_download(
 
     let result = runtime.block_on(async {
         // Get manifest info from API
-        let client = match ApiClient::new() {
+        eprintln!("Creating API client...");
+        let client = match ApiClient::new_with_key(key) {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(e) => {
+                eprintln!("Failed to create API client: {:?}", e);
+                return false;
+            }
         };
 
+        eprintln!("Fetching manifest info from Bungie API...");
         let manifest_url = "https://www.bungie.net/Platform/Destiny2/Manifest/";
         let response = match client.call_and_parse::<ManifestResponse>(manifest_url).await {
             Ok(r) => r,
-            Err(_) => return false,
+            Err(e) => {
+                eprintln!("Failed to fetch manifest info: {:?}", e);
+                return false;
+            }
         };
 
         let manifest = match &response.response {
             Some(e) => e,
-            None => return false,
+            None => {
+                eprintln!("Empty manifest response");
+                return false;
+            }
         };
 
-        let download_url = format!("https://www.bungie.net{}", manifest.mobile_world_content_paths.en);
+        let download_url = if manifest.mobile_world_content_paths.en.starts_with("http") {
+            manifest.mobile_world_content_paths.en.clone()
+        } else {
+            format!("https://www.bungie.net{}", manifest.mobile_world_content_paths.en)
+        };
         let version = &manifest.version;
+        eprintln!("Downloading manifest version {} from {}", version, download_url);
 
         // Download the manifest zip file
         let mut download_response = match client.call(&download_url).await {
             Ok(r) => r,
-            Err(_) => return false,
+            Err(e) => {
+                eprintln!("Failed to download manifest: {:?}", e);
+                return false;
+            }
         };
 
+        eprintln!("Reading manifest chunks...");
         let mut out: Vec<u8> = Vec::new();
         while let Some(chunk) = match download_response.chunk().await {
             Ok(c) => c,
-            Err(_) => return false,
-        } {
-            if let Err(_) = out.write_all(&chunk).await {
+            Err(e) => {
+                eprintln!("Failed to read chunk: {:?}", e);
                 return false;
             }
+        } {
+            out.extend_from_slice(&chunk);
         }
+        eprintln!("Downloaded {} bytes", out.len());
 
         // Unzip the manifest
+        eprintln!("Unzipping manifest...");
         let cursor = std::io::Cursor::new(out);
         let mut zip = match zip::ZipArchive::new(cursor) {
             Ok(z) => z,
-            Err(_) => return false,
+            Err(e) => {
+                eprintln!("Failed to open zip archive: {:?}", e);
+                return false;
+            }
         };
 
         let mut manifest_file = match zip.by_index(0) {
             Ok(f) => f,
-            Err(_) => return false,
+            Err(e) => {
+                eprintln!("Failed to get file from zip: {:?}", e);
+                return false;
+            }
         };
 
         let manifest_path = dir.join("manifest.sqlite3");
+        eprintln!("Writing manifest to {:?}", manifest_path);
         let mut outfile = match fs::File::create(&manifest_path) {
             Ok(f) => f,
-            Err(_) => return false,
+            Err(e) => {
+                eprintln!("Failed to create manifest file: {:?}", e);
+                return false;
+            }
         };
 
-        if let Err(_) = std::io::copy(&mut manifest_file, &mut outfile) {
+        if let Err(e) = std::io::copy(&mut manifest_file, &mut outfile) {
+            eprintln!("Failed to write manifest: {:?}", e);
             return false;
         }
 
@@ -774,10 +850,13 @@ pub extern "C" fn dcli_manifest_download(
         );
 
         let info_path = dir.join("manifest_info.json");
-        if let Err(_) = fs::write(&info_path, &info_json) {
+        eprintln!("Writing manifest info to {:?}", info_path);
+        if let Err(e) = fs::write(&info_path, &info_json) {
+            eprintln!("Failed to write manifest info: {:?}", e);
             return false;
         }
 
+        eprintln!("Manifest download complete!");
         true
     });
 
