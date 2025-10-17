@@ -358,7 +358,7 @@ impl ActivityStoreInterface {
     ) -> Result<(), Error> {
         let row_option = sqlx::query(
             r#"
-            SELECT "member_id" from "member" 
+            SELECT "member_id" from "member"
             where bungie_display_name = ? and bungie_display_name_code = ?
         "#,
         )
@@ -377,9 +377,25 @@ impl ActivityStoreInterface {
             }
         };
 
+        // Delete from sync table first
         sqlx::query(
             r#"
             delete from "sync" where member = ?
+        "#,
+        )
+        .bind(id)
+        .execute(&mut self.db)
+        .await?;
+
+        // Delete the member record, which will cascade delete all related data:
+        // - characters (via ON DELETE CASCADE)
+        // - character_activity_stats (via ON DELETE CASCADE on character)
+        // - weapon_result (via ON DELETE CASCADE on character_activity_stats)
+        // - medal_result (via ON DELETE CASCADE on character_activity_stats)
+        // - activity_queue (via ON DELETE CASCADE on character)
+        sqlx::query(
+            r#"
+            delete from "member" where member_id = ?
         "#,
         )
         .bind(id)
