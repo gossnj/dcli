@@ -8,12 +8,17 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-dcli = { path = "../dcli" }
+# Use rustls-tls for Android cross-compilation (no OpenSSL needed)
+dcli = { path = "../dcli", default-features = false, features = ["rustls-tls"] }
 libc = "0.2"
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread"] }
 chrono = "0.4"
 serde_json = "1.0"
 zip = "0.5"
+
+# Android JNI support
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
