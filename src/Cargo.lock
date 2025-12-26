@@ -408,6 +408,7 @@ dependencies = [
  "jni",
  "libc",
  "log",
+ "reqwest",
  "serde_json",
  "tokio",
  "zip",

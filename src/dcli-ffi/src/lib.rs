@@ -747,6 +747,9 @@ pub extern "C" fn dcli_manifest_needs_update(
     }
 }
 
+/// Timeout for manifest downloads (2 minutes) - manifest is ~100MB compressed
+const MANIFEST_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
+
 /// Downloads and installs the manifest
 /// Returns true on success, false on error
 #[no_mangle]
@@ -785,7 +788,7 @@ pub extern "C" fn dcli_manifest_download(
     };
 
     let result = runtime.block_on(async {
-        // Get manifest info from API
+        // Get manifest info from API (use standard client for quick API call)
         debug!("Creating API client...");
         let client = match ApiClient::new_with_key(key) {
             Ok(c) => c,
@@ -819,10 +822,21 @@ pub extern "C" fn dcli_manifest_download(
             format!("https://www.bungie.net{}", manifest.mobile_world_content_paths.en)
         };
         let version = &manifest.version;
-        info!("Downloading manifest version {} from {}", version, download_url);
+        info!("Downloading manifest version {} from {} (timeout: {}s)", version, download_url, MANIFEST_DOWNLOAD_TIMEOUT_SECS);
+
+        // Create a separate client with longer timeout for the large manifest download
+        let download_client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(MANIFEST_DOWNLOAD_TIMEOUT_SECS))
+            .build() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to create download client: {:?}", e);
+                return false;
+            }
+        };
 
         // Download the manifest zip file
-        let mut download_response = match client.call(&download_url).await {
+        let mut download_response = match download_client.get(&download_url).send().await {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to download manifest: {:?}", e);
