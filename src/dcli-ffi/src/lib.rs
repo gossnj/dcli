@@ -27,15 +27,20 @@ mod android;
 use log::{info, error, debug, LevelFilter};
 
 #[cfg(target_os = "android")]
-use android_logger::Config;
+use android_logger::{Config, FilterBuilder};
 
 /// Initialize logging for Android. Safe to call multiple times.
+/// Filters out verbose sqlx query logging to improve performance.
 #[cfg(target_os = "android")]
 fn init_android_logging() {
     android_logger::init_once(
         Config::default()
             .with_max_level(LevelFilter::Debug)
             .with_tag("dcli_ffi")
+            .with_filter(FilterBuilder::new()
+                .filter(Some("sqlx"), LevelFilter::Warn)  // Silence sqlx query spam
+                .filter(Some("dcli_ffi"), LevelFilter::Debug)
+                .build())
     );
 }
 
