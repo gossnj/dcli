@@ -24,6 +24,26 @@
 #[cfg(target_os = "android")]
 mod android;
 
+use log::{info, error, debug, LevelFilter};
+
+#[cfg(target_os = "android")]
+use android_logger::Config;
+
+/// Initialize logging for Android. Safe to call multiple times.
+#[cfg(target_os = "android")]
+fn init_android_logging() {
+    android_logger::init_once(
+        Config::default()
+            .with_max_level(LevelFilter::Debug)
+            .with_tag("dcli_ffi")
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+fn init_android_logging() {
+    // No-op on non-Android platforms
+}
+
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
@@ -76,6 +96,8 @@ pub struct DcliCharacter {
 /// Caller must call dcli_client_free when done
 #[no_mangle]
 pub extern "C" fn dcli_client_new(api_key: *const c_char) -> *mut DcliApiClient {
+    init_android_logging();
+
     if api_key.is_null() {
         return std::ptr::null_mut();
     }
@@ -284,6 +306,8 @@ pub type ProgressCallback = extern "C" fn(*const c_char, u32, u32, *mut std::ffi
 pub extern "C" fn dcli_store_init(
     data_dir: *const c_char,
 ) -> *mut DcliActivityStore {
+    init_android_logging();
+
     if data_dir.is_null() {
         return std::ptr::null_mut();
     }
@@ -463,17 +487,17 @@ pub extern "C" fn dcli_store_sync_player_with_progress(
         let store_ref = &mut (*store_ptr).store;
 
         runtime.block_on(async {
-            eprintln!("🔄 Starting sync for player: {}", name_str);
+            info!("Starting sync for player: {}", name_str);
             send_progress("Initializing sync...", 0, 100);
 
             match store_ref.sync_player(&player_name).await {
                 Ok(_) => {
-                    eprintln!("✅ Successfully synced player: {}", name_str);
+                    info!("Successfully synced player: {}", name_str);
                     send_progress("Sync complete!", 100, 100);
                     true
                 },
                 Err(e) => {
-                    eprintln!("❌ Failed to sync player {}: {:?}", name_str, e);
+                    error!("Failed to sync player {}: {:?}", name_str, e);
                     send_progress(&format!("Sync failed: {:?}", e), 0, 100);
                     false
                 }
@@ -725,6 +749,8 @@ pub extern "C" fn dcli_manifest_download(
     data_dir: *const c_char,
     api_key: *const c_char,
 ) -> bool {
+    init_android_logging();
+
     if data_dir.is_null() || api_key.is_null() {
         return false;
     }
@@ -755,21 +781,21 @@ pub extern "C" fn dcli_manifest_download(
 
     let result = runtime.block_on(async {
         // Get manifest info from API
-        eprintln!("Creating API client...");
+        debug!("Creating API client...");
         let client = match ApiClient::new_with_key(key) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to create API client: {:?}", e);
+                error!("Failed to create API client: {:?}", e);
                 return false;
             }
         };
 
-        eprintln!("Fetching manifest info from Bungie API...");
+        debug!("Fetching manifest info from Bungie API...");
         let manifest_url = "https://www.bungie.net/Platform/Destiny2/Manifest/";
         let response = match client.call_and_parse::<ManifestResponse>(manifest_url).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to fetch manifest info: {:?}", e);
+                error!("Failed to fetch manifest info: {:?}", e);
                 return false;
             }
         };
@@ -777,7 +803,7 @@ pub extern "C" fn dcli_manifest_download(
         let manifest = match &response.response {
             Some(e) => e,
             None => {
-                eprintln!("Empty manifest response");
+                error!("Empty manifest response");
                 return false;
             }
         };
@@ -788,37 +814,37 @@ pub extern "C" fn dcli_manifest_download(
             format!("https://www.bungie.net{}", manifest.mobile_world_content_paths.en)
         };
         let version = &manifest.version;
-        eprintln!("Downloading manifest version {} from {}", version, download_url);
+        info!("Downloading manifest version {} from {}", version, download_url);
 
         // Download the manifest zip file
         let mut download_response = match client.call(&download_url).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to download manifest: {:?}", e);
+                error!("Failed to download manifest: {:?}", e);
                 return false;
             }
         };
 
-        eprintln!("Reading manifest chunks...");
+        debug!("Reading manifest chunks...");
         let mut out: Vec<u8> = Vec::new();
         while let Some(chunk) = match download_response.chunk().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to read chunk: {:?}", e);
+                error!("Failed to read chunk: {:?}", e);
                 return false;
             }
         } {
             out.extend_from_slice(&chunk);
         }
-        eprintln!("Downloaded {} bytes", out.len());
+        debug!("Downloaded {} bytes", out.len());
 
         // Unzip the manifest
-        eprintln!("Unzipping manifest...");
+        debug!("Unzipping manifest...");
         let cursor = std::io::Cursor::new(out);
         let mut zip = match zip::ZipArchive::new(cursor) {
             Ok(z) => z,
             Err(e) => {
-                eprintln!("Failed to open zip archive: {:?}", e);
+                error!("Failed to open zip archive: {:?}", e);
                 return false;
             }
         };
@@ -826,23 +852,23 @@ pub extern "C" fn dcli_manifest_download(
         let mut manifest_file = match zip.by_index(0) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("Failed to get file from zip: {:?}", e);
+                error!("Failed to get file from zip: {:?}", e);
                 return false;
             }
         };
 
         let manifest_path = dir.join("manifest.sqlite3");
-        eprintln!("Writing manifest to {:?}", manifest_path);
+        debug!("Writing manifest to {:?}", manifest_path);
         let mut outfile = match fs::File::create(&manifest_path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("Failed to create manifest file: {:?}", e);
+                error!("Failed to create manifest file: {:?}", e);
                 return false;
             }
         };
 
         if let Err(e) = std::io::copy(&mut manifest_file, &mut outfile) {
-            eprintln!("Failed to write manifest: {:?}", e);
+            error!("Failed to write manifest: {:?}", e);
             return false;
         }
 
@@ -854,13 +880,13 @@ pub extern "C" fn dcli_manifest_download(
         );
 
         let info_path = dir.join("manifest_info.json");
-        eprintln!("Writing manifest info to {:?}", info_path);
+        debug!("Writing manifest info to {:?}", info_path);
         if let Err(e) = fs::write(&info_path, &info_json) {
-            eprintln!("Failed to write manifest info: {:?}", e);
+            error!("Failed to write manifest info: {:?}", e);
             return false;
         }
 
-        eprintln!("Manifest download complete!");
+        info!("Manifest download complete!");
         true
     });
 
