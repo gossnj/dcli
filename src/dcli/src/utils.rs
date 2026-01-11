@@ -46,6 +46,8 @@ pub const TSV_DELIM: &str = "\t";
 
 pub const COMPETITIVE_PVP_ACTIVITY_HASH: u32 = 2754695317;
 pub const FREELANCE_COMPETITIVE_PVP_ACTIVITY_HASH: u32 = 2607135461;
+// New competitive hash for Season 25+ (Codename: Heresy)
+pub const COMPETITIVE_PVP_ACTIVITY_HASH_S25: u32 = 814159553;
 
 //pub const CHECKMATE_CONTROL_ACTIVITY_HASH: u32 = 3374318171;
 //480175362let my_array: [i32; 2] = [1, 2];

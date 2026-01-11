@@ -32,7 +32,8 @@ use crate::utils::{
     format_error, CHECKMATE_CLASH_ACTIVITY_HASH,
     CHECKMATE_CONTROL_ACTIVITY_HASHES, CHECKMATE_COUNTDOWN_ACTIVITY_HASH,
     CHECKMATE_RUMBLE_ACTIVITY_HASH, CHECKMATE_SURVIVAL_ACTIVITY_HASH,
-    COMPETITIVE_PVP_ACTIVITY_HASH, FREELANCE_COMPETITIVE_PVP_ACTIVITY_HASH,
+    COMPETITIVE_PVP_ACTIVITY_HASH, COMPETITIVE_PVP_ACTIVITY_HASH_S25,
+    FREELANCE_COMPETITIVE_PVP_ACTIVITY_HASH,
     IRON_BANNER_FORTRESS_ACTIVITY_HASH, IRON_BANNER_TRIBUTE_ACTIVITY_HASH,
 };
 use crate::{
@@ -357,7 +358,7 @@ impl ActivityStoreInterface {
     ) -> Result<(), Error> {
         let row_option = sqlx::query(
             r#"
-            SELECT "member_id" from "member" 
+            SELECT "member_id" from "member"
             where bungie_display_name = ? and bungie_display_name_code = ?
         "#,
         )
@@ -376,9 +377,25 @@ impl ActivityStoreInterface {
             }
         };
 
+        // Delete from sync table first
         sqlx::query(
             r#"
             delete from "sync" where member = ?
+        "#,
+        )
+        .bind(id)
+        .execute(&mut self.db)
+        .await?;
+
+        // Delete the member record, which will cascade delete all related data:
+        // - characters (via ON DELETE CASCADE)
+        // - character_activity_stats (via ON DELETE CASCADE on character)
+        // - weapon_result (via ON DELETE CASCADE on character_activity_stats)
+        // - medal_result (via ON DELETE CASCADE on character_activity_stats)
+        // - activity_queue (via ON DELETE CASCADE on character)
+        sqlx::query(
+            r#"
+            delete from "member" where member_id = ?
         "#,
         )
         .bind(id)
@@ -963,6 +980,8 @@ impl ActivityStoreInterface {
             == COMPETITIVE_PVP_ACTIVITY_HASH
             || activity.activity_details.director_activity_hash
                 == FREELANCE_COMPETITIVE_PVP_ACTIVITY_HASH
+            || activity.activity_details.director_activity_hash
+                == COMPETITIVE_PVP_ACTIVITY_HASH_S25
         {
 
             /*
