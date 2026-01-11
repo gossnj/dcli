@@ -20,15 +20,27 @@
 * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-use log::{info, error, debug, LevelFilter};
+// Android JNI bindings
+#[cfg(target_os = "android")]
+mod android;
 
+use log::{info, error, debug};
+
+#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
+use log::LevelFilter;
+
+// ============================================================================
+// Platform-specific logging initialization
+// ============================================================================
+
+// Apple platforms (iOS/macOS) - use OSLog
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use oslog::OsLogger;
 
 /// Initialize logging for Apple platforms. Safe to call multiple times.
 /// Filters out verbose sqlx query logging to improve performance.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
-fn init_apple_logging() {
+fn init_platform_logging() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -40,9 +52,29 @@ fn init_apple_logging() {
     });
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
-fn init_apple_logging() {
-    // No-op on non-Apple platforms
+// Android - use android_logger
+#[cfg(target_os = "android")]
+use android_logger::{Config, FilterBuilder};
+
+/// Initialize logging for Android. Safe to call multiple times.
+/// Filters out verbose sqlx query logging to improve performance.
+#[cfg(target_os = "android")]
+fn init_platform_logging() {
+    android_logger::init_once(
+        Config::default()
+            .with_max_level(LevelFilter::Debug)
+            .with_tag("dcli_ffi")
+            .with_filter(FilterBuilder::new()
+                .filter(Some("sqlx"), LevelFilter::Warn)  // Silence sqlx query spam
+                .filter(Some("dcli_ffi"), LevelFilter::Debug)
+                .build())
+    );
+}
+
+// Other platforms - no-op
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
+fn init_platform_logging() {
+    // No-op on other platforms
 }
 
 use std::ffi::{CStr, CString};
@@ -97,7 +129,7 @@ pub struct DcliCharacter {
 /// Caller must call dcli_client_free when done
 #[no_mangle]
 pub extern "C" fn dcli_client_new(api_key: *const c_char) -> *mut DcliApiClient {
-    init_apple_logging();
+    init_platform_logging();
 
     if api_key.is_null() {
         return std::ptr::null_mut();
@@ -307,7 +339,7 @@ pub type ProgressCallback = extern "C" fn(*const c_char, u32, u32, *mut std::ffi
 pub extern "C" fn dcli_store_init(
     data_dir: *const c_char,
 ) -> *mut DcliActivityStore {
-    init_apple_logging();
+    init_platform_logging();
 
     if data_dir.is_null() {
         return std::ptr::null_mut();
@@ -753,7 +785,7 @@ pub extern "C" fn dcli_manifest_download(
     data_dir: *const c_char,
     api_key: *const c_char,
 ) -> bool {
-    init_apple_logging();
+    init_platform_logging();
 
     if data_dir.is_null() || api_key.is_null() {
         return false;
