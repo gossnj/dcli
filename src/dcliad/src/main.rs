@@ -51,7 +51,7 @@ use dcli::utils::{
 };
 
 use dcli::utils::EXIT_FAILURE;
-use structopt::StructOpt;
+use clap::Parser;
 
 const ELO_SCALE: f32 = 10.0;
 
@@ -469,8 +469,8 @@ fn print_default(
     tell::update!();
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(verbatim_doc_comment)]
+#[derive(Parser, Debug)]
+#[command(about, verbatim_doc_comment)]
 /// Command line tool for retrieving and viewing Destiny 2 Crucible activity details.
 ///
 /// By default the details on the last activity will be displayed, and you can
@@ -494,7 +494,7 @@ struct Opt {
     /// Name must be in the format of NAME#CODE. Example: foo#3280
     /// You can find your name in game, or on Bungie's site at:
     /// https://www.bungie.net/7/en/User/Account/IdentitySettings
-    #[structopt(long = "name", short = "n", required = true)]
+    #[arg(long = "name", short = 'n')]
     name: PlayerName,
 
     /// Activity mode from which to return last activity
@@ -509,48 +509,46 @@ struct Opt {
     /// rift_competitive, showdown, lockdown, iron_banner_rift,
     /// zone_control, iron_banner_zone_control, rift,
     /// scorched, scorched_team, breakthrough, clash_quickplay, trials_of_the_nine, relic, countdown_competitive, checkmate_all, checkmate_control, checkmate_rumble, checkmate_survival, checkmate_rumble, checkmate_clash, checkmate_countdown, collision_competitive, iron_banner_tribute, iron_banner_fortress
-    #[structopt(long = "mode", short = "M", 
-        parse(try_from_str=parse_and_validate_mode), default_value = "all_pvp")]
+    #[arg(long = "mode", short = 'M', value_parser = parse_and_validate_mode, default_value = "all_pvp")]
     mode: Mode,
 
     /// Character class to retrieve data for
     ///
     /// Valid values include hunter, titan, warlock, last_active and all.
-    #[structopt(short = "C", long = "class", default_value = "all")]
+    #[arg(short = 'C', long = "class", default_value = "all")]
     character_class_selection: CharacterClassSelection,
 
     ///Print out additional information
-
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
     /// Sync player activities
-    #[structopt(long = "sync", short = "s")]
+    #[arg(long = "sync", short = 's')]
     sync: bool,
 
     /// Display extended activity details
     ///
     /// If flag is set, additional information will be displayed, including per
     /// user weapon stats.
-    #[structopt(short = "d", long = "details")]
+    #[arg(short = 'd', long = "details")]
     details: bool,
 
     /// The number of weapons to display details for
-    #[structopt(long = "weapon-count", short = "w", default_value = "5")]
+    #[arg(long = "weapon-count", short = 'w', default_value = "5")]
     weapon_count: u32,
 
     /// The activity id of the activity to display data about
     ///
     /// By default, the last activity will be displayed. The index can be retrieved
     /// from other dcli apps, such as dcliah, or directly from the sqlite datastore.
-    #[structopt(long = "activity-id", short = "a")]
+    #[arg(long = "activity-id", short = 'a')]
     activity_id: Option<i64>,
 
     /// Directory where Destiny 2 manifest and activity database files are stored. (optional)
     ///
     /// This will normally be downloaded using the dclim tool, and uses
     /// a system appropriate directory by default.
-    #[structopt(short = "D", long = "data-dir", parse(from_os_str))]
+    #[arg(short = 'D', long = "data-dir")]
     data_dir: Option<PathBuf>,
 
     /// API key from Bungie required for some actions.
@@ -558,12 +556,12 @@ struct Opt {
     /// If specified the key will be passed to all Destiny API calls.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[structopt(short = "k", long = "api-key", env = "DESTINY_API_KEY")]
+    #[arg(short = 'k', long = "api-key", env = "DESTINY_API_KEY")]
     api_key: Option<String>,
 }
 #[tokio::main]
 async fn main() {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let level = if opt.verbose {
         TellLevel::Verbose

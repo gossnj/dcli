@@ -39,7 +39,7 @@ use dcli::enums::character::CharacterClassSelection;
 use dcli::activitystoreinterface::ActivityStoreInterface;
 
 use dcli::utils::EXIT_FAILURE;
-use structopt::StructOpt;
+use clap::Parser;
 
 #[allow(clippy::too_many_arguments)]
 fn print_default(data: &PlayerActivitiesSummary, stats: &[Stat]) {
@@ -108,8 +108,8 @@ fn print_default(data: &PlayerActivitiesSummary, stats: &[Stat]) {
     tell::update!("{}", out.join(","));
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(verbatim_doc_comment)]
+#[derive(Parser, Debug)]
+#[command(about, verbatim_doc_comment)]
 /// Command line tool for retrieving and viewing Destiny 2 Crucible activity history.
 ///
 /// Enables control of which stats are displayed based on game mode, moment range
@@ -131,7 +131,7 @@ struct Opt {
     /// Name must be in the format of NAME#CODE. Example: foo#3280
     /// You can find your name in game, or on Bungie's site at:
     /// https://www.bungie.net/7/en/User/Account/IdentitySettings
-    #[structopt(long = "name", short = "n", required = true)]
+    #[arg(long = "name", short = 'n')]
     name: PlayerName,
 
     /// Custom start time in RFC 3339 date / time format
@@ -141,7 +141,7 @@ struct Opt {
     /// Example RFC 3339 format: 2020-12-08T17:00:00.774187+00:00
     ///
     /// Required when --moment is set to custom, but otherwise not applicable.
-    #[structopt(short = "t", long = "custom-time", parse(try_from_str = parse_rfc3339), required_if("moment", "custom"))]
+    #[arg(short = 't', long = "custom-time", value_parser = parse_rfc3339, required_if_eq("moment", "custom"))]
     custom_time: Option<DateTime<Utc>>,
 
     /// Custom end time in RFC 3339 date / time format
@@ -151,7 +151,7 @@ struct Opt {
     /// Example RFC 3339 format: 2020-12-08T17:00:00.774187+00:00
     ///
     /// Required when --end-moment is set to custom, but otherwise not applicable.
-    #[structopt(short = "e", long = "end-custom-time", parse(try_from_str = parse_rfc3339), required_if("end-moment", "custom"))]
+    #[arg(short = 'e', long = "end-custom-time", value_parser = parse_rfc3339, required_if_eq("end_moment", "custom"))]
     end_custom_time: Option<DateTime<Utc>>,
 
     /// Start moment from which to pull activities from
@@ -176,7 +176,7 @@ struct Opt {
     ///
     /// For example:
     /// --moment custom --custom-time 2020-12-08T17:00:00.774187+00:00
-    #[structopt(long = "moment", short = "T", default_value = "week")]
+    #[arg(long = "moment", short = 'T', default_value = "week")]
     moment: Moment,
 
     /// End moment from which to pull activities from
@@ -203,7 +203,7 @@ struct Opt {
     ///
     /// For example:
     /// --moment custom --end-custom-time 2020-12-08T17:00:00.774187+00:00
-    #[structopt(long = "end-moment", short = "E", default_value = "now")]
+    #[arg(long = "end-moment", short = 'E', default_value = "now")]
     end_moment: Moment,
 
     /// Activity mode to return stats for
@@ -218,14 +218,13 @@ struct Opt {
     /// rift_competitive, showdown, lockdown, iron_banner_rift,
     /// zone_control, iron_banner_zone_control, rift,
     /// scorched, scorched_team, breakthrough, clash_quickplay, trials_of_the_nine, relic, countdown_competitive, checkmate_all, checkmate_control, checkmate_rumble, checkmate_survival, checkmate_rumble, checkmate_clash, checkmate_countdown, collision_competitive, iron_banner_tribute, iron_banner_fortress
-    #[structopt(long = "mode", short = "M", 
-        parse(try_from_str=parse_and_validate_crucible_mode), default_value = "all_pvp")]
+    #[arg(long = "mode", short = 'M', value_parser = parse_and_validate_crucible_mode, default_value = "all_pvp")]
     mode: Mode,
 
     /// Character to retrieve data for
     ///
     /// Valid values include hunter, titan, warlock, last_active and all.
-    #[structopt(short = "C", long = "class", default_value = "all")]
+    #[arg(short = 'C', long = "class", default_value = "all")]
     character_class_selection: CharacterClassSelection,
 
     /// Stat to retrieve data for
@@ -234,22 +233,22 @@ struct Opt {
     /// assists, kills_avg, opponents_defeated_avg, deaths_avg, assists_avg,
     /// kd_max, kda_max, efficiency_max, kills_max, opponents_defeated_max,
     /// deaths_max, games, wins, losses, mercies.
-    #[structopt(short = "x", long = "stat", required = true)]
+    #[arg(short = 'x', long = "stat")]
     stat: Vec<Stat>,
 
     ///Print out additional information
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
     /// Sync player activities
-    #[structopt(long = "sync", short = "s")]
+    #[arg(long = "sync", short = 's')]
     sync: bool,
 
     /// Directory where Destiny 2 manifest and activity database files are stored. (optional)
     ///
     /// This will normally be downloaded using the dclim tool, and uses
     /// a system appropriate directory by default.
-    #[structopt(short = "D", long = "data-dir", parse(from_os_str))]
+    #[arg(short = 'D', long = "data-dir")]
     data_dir: Option<PathBuf>,
 
     /// API key from Bungie required for some actions.
@@ -257,12 +256,12 @@ struct Opt {
     /// If specified the key will be passed to all Destiny API calls.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[structopt(short = "k", long = "api-key", env = "DESTINY_API_KEY")]
+    #[arg(short = 'k', long = "api-key", env = "DESTINY_API_KEY")]
     api_key: Option<String>,
 }
 #[tokio::main]
 async fn main() {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let level = if opt.verbose {
         TellLevel::Verbose

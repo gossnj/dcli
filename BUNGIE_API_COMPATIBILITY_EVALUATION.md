@@ -158,21 +158,22 @@ Not directly relevant to dcli's read-only use case.
 
 ---
 
-## 5. Dependency Updates
+## 5. Dependency Updates ✅ COMPLETED
 
-### Current Dependencies (from Cargo.toml)
-| Dependency | Current Version | Latest Stable | Update Priority |
-|------------|-----------------|---------------|-----------------|
-| reqwest | 0.11.12 | 0.12.x | Medium |
-| sqlx | 0.6.2 | 0.8.x | Medium |
-| serde | 1.0.147 | 1.0.x | Low |
-| chrono | 0.4.23 | 0.4.x | Low |
-| tokio | (via sqlx) | Latest | Medium |
+### Dependencies (Updated January 2026)
+| Dependency | Previous | Updated To | Status |
+|------------|----------|------------|--------|
+| reqwest | 0.11.12 | 0.12.x | ✅ Updated |
+| sqlx | 0.6.2 | 0.8.x | ✅ Updated |
+| structopt | 0.3.26 | clap 4.x | ✅ Migrated |
+| serde | 1.0.147 | 1.0.x | Current |
+| chrono | 0.4.23 | 0.4.x | Current |
 
-### Recommendations
-1. **reqwest 0.12.x** - Includes HTTP/3 support, improved performance
-2. **sqlx 0.8.x** - Better compile-time checking, new features
-3. Consider migrating from **structopt** to **clap v4** (structopt is deprecated)
+### Changes Made
+1. **reqwest 0.12.x** - HTTP/3 support, improved performance ✅
+2. **sqlx 0.8.x** - Better compile-time checking, new features ✅
+3. **clap v4 migration** - Migrated all 8 CLI tools from deprecated structopt ✅
+4. Added `Clone` derive to `WeaponSort` and `DateTimeFormat` enums for clap v4 compatibility
 
 ---
 
@@ -204,8 +205,8 @@ New API fields are often added as optional. The library's serde configuration ha
 3. ~~**Verify and update Mode enum** - Ensure all current modes are supported~~ ✅ DONE (verified up-to-date)
 
 ### Medium Priority
-4. **Add PGCR difficulty/skull data** - Useful for activity analysis
-5. **Update dependencies** - reqwest, sqlx, migrate from structopt
+4. ~~**Add PGCR difficulty/skull data**~~ - Not relevant for PvP (skulls/difficulty apply to PvE)
+5. ~~**Update dependencies** - reqwest 0.12, sqlx 0.8, clap v4 migration~~ ✅ DONE
 6. **Add `isAdept`/`isHolofoil` to weapon data** - Enhanced weapon tracking
 
 ### Low Priority

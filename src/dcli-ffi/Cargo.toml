@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 # Use rustls-tls for cross-compilation (no OpenSSL needed)
 dcli = { path = "../dcli", default-features = false, features = ["rustls-tls"] }
-reqwest = { version = "0.11.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 libc = "0.2"
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread"] }
 chrono = "0.4"

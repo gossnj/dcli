@@ -33,7 +33,7 @@ use dcli::response::manifest::ManifestResponse;
 use dcli::utils::{build_tsv, determine_data_dir};
 use dcli::utils::{format_error, EXIT_FAILURE};
 use manifest_info::ManifestInfo;
-use structopt::StructOpt;
+use clap::Parser;
 use tell::{Tell, TellLevel};
 use tokio::io::AsyncWriteExt;
 
@@ -108,8 +108,8 @@ async fn download_manifest(url: &str, path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(verbatim_doc_comment)]
+#[derive(Parser, Debug)]
+#[command(about, verbatim_doc_comment)]
 /// Command line tool for retrieving and managing the Destiny 2 manifest database.
 ///
 /// Manifest will be stored in the specified local directory with the file name:
@@ -132,20 +132,19 @@ struct Opt {
     /// By default data will be loaded from and stored in the appropriate system
     /// local storage directory. Manifest will be stored in a sqlite3 database file
     /// named manifest.sqlite3
-    #[structopt(short = "D", long = "data-dir", parse(from_os_str))]
+    #[arg(short = 'D', long = "data-dir")]
     data_dir: Option<PathBuf>,
 
     ///Print out additional information
-
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
     ///Force a download of manifest regardless of whether it has been updated.
-    #[structopt(short = "F", long = "force", conflicts_with = "check")]
+    #[arg(short = 'F', long = "force", conflicts_with = "check")]
     force: bool,
 
     ///Check whether a new manifest version is available, but do not download.
-    #[structopt(short = "K", long = "check")]
+    #[arg(short = 'K', long = "check")]
     check: bool,
 
     /// Format for command output
@@ -154,16 +153,12 @@ struct Opt {
     ///
     /// tsv outputs in a tab (\t) separated format of name / value pairs with lines
     /// ending in a new line character (\n).
-    #[structopt(
-        short = "O",
-        long = "output-format",
-        default_value = "default"
-    )]
+    #[arg(short = 'O', long = "output-format", default_value = "default")]
     output: Output,
 }
 #[tokio::main]
 async fn main() {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let level = if opt.verbose {
         TellLevel::Verbose

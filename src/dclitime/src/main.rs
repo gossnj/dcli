@@ -26,11 +26,11 @@ use datetimeformat::DateTimeFormat;
 use dcli::enums::moment::Moment;
 use dcli::output::Output;
 use dcli::utils::build_tsv;
-use structopt::StructOpt;
+use clap::Parser;
 use tell::{Tell, TellLevel};
 
-#[derive(StructOpt, Debug)]
-#[structopt(verbatim_doc_comment)]
+#[derive(Parser, Debug)]
+#[command(about, verbatim_doc_comment)]
 /// Command line tool for retrieving date / time stamps for Destiny 2 weekly event
 /// moments
 ///
@@ -51,18 +51,18 @@ struct Opt {
     /// next_weekly (upcoming Tuesday weekly reset), current_daily, next_daily,
     /// current_xur (previous Friday Xur reset), next_xur (upcoming Friday Xur reset),
     /// current_trials (previous Friday Trials reset), next_trials (upcoming Friday Trials reset)
-    #[structopt(short = "T", long = "moment", default_value = "now")]
+    #[arg(short = 'T', long = "moment", default_value = "now")]
     moment: Moment,
 
     /// Date / time format to output moment
     ///
     /// Valid values are rfc3339 (default), rfc2822 and unix (unix timestamp,
     /// number of non-leap seconds since January 1, 1970 0:00:00 UTC).
-    #[structopt(short = "f", long = "time-format", default_value = "rfc3339")]
+    #[arg(short = 'f', long = "time-format", default_value = "rfc3339")]
     time_format: DateTimeFormat,
 
     /// Print out additional information
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
     /// Format for command output
@@ -71,17 +71,13 @@ struct Opt {
     ///
     /// tsv outputs in a tab (\t) separated format of name / value pairs with lines
     /// ending in a new line character (\n).
-    #[structopt(
-        short = "O",
-        long = "output-format",
-        default_value = "default"
-    )]
+    #[arg(short = 'O', long = "output-format", default_value = "default")]
     output: Output,
 }
 
 #[tokio::main]
 async fn main() {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let level = if opt.verbose {
         TellLevel::Verbose
