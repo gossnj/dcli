@@ -49,7 +49,7 @@ use crate::{
 use futures::TryStreamExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::Row;
-use sqlx::{ConnectOptions, SqliteConnection};
+use sqlx::{ConnectOptions, QueryBuilder, Sqlite, SqliteConnection};
 
 use crate::crucible::{
     ActivityDetail, CruciblePlayerActivityPerformance,
@@ -1549,47 +1549,39 @@ impl ActivityStoreInterface {
 
         let character_activity_stats_id: i32 = row.try_get("id")?;
 
-        for (key, value) in medal_hash {
-            sqlx::query(
-                r#"
-                INSERT INTO "main"."medal_result"
-                (
-                    "reference_id", "count", "character_activity_stats"
-                )
-                VALUES  (
-                    ?,?,?
-                )
-                "#,
-            )
-            .bind(key) //reference_id
-            .bind(format!("{}", value.basic.value as u32)) //unique_weapon_kills
-            .bind(character_activity_stats_id)
-            .execute(&mut self.db)
-            .await?;
+        // Bulk insert medals using QueryBuilder for better performance
+        if !medal_hash.is_empty() {
+            let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+                r#"INSERT INTO "main"."medal_result" ("reference_id", "count", "character_activity_stats") "#,
+            );
+
+            query_builder.push_values(medal_hash.iter(), |mut b, (key, value)| {
+                b.push_bind(key.clone())
+                    .push_bind(format!("{}", value.basic.value as u32))
+                    .push_bind(character_activity_stats_id);
+            });
+
+            query_builder.build().execute(&mut self.db).await?;
         }
 
-        //ran into a case once where weapons was missing, so have to check here
+        // Bulk insert weapons using QueryBuilder for better performance
         if entry.extended.is_some() {
             let extended = char_data.extended.as_ref().unwrap();
-            if extended.weapons.is_some() {
-                let weapons = extended.weapons.as_ref().unwrap();
-                for w in weapons {
-                    sqlx::query(
-                        r#"
-                        INSERT INTO "main"."weapon_result"
-                        (
-                            "reference_id", "kills", "precision_kills", "kills_precision_kills_ratio", "character_activity_stats"
-                        )
-                        VALUES (?, ?, ?, ?, ?)
-                        "#,
-                    )
-                    .bind(format!("{}", w.reference_id)) //reference_id
-                    .bind(format!("{}", w.values.unique_weapon_kills as u32)) //unique_weapon_kills
-                    .bind(format!("{}", w.values.unique_weapon_precision_kills as u32)) //unique_weapon_precision_kills
-                    .bind(format!("{}", w.values.unique_weapon_kills_precision_kills)) //unique_weapon_kills_precision_kills
-                    .bind(character_activity_stats_id)
-                    .execute(&mut self.db)
-                    .await?;
+            if let Some(weapons) = &extended.weapons {
+                if !weapons.is_empty() {
+                    let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+                        r#"INSERT INTO "main"."weapon_result" ("reference_id", "kills", "precision_kills", "kills_precision_kills_ratio", "character_activity_stats") "#,
+                    );
+
+                    query_builder.push_values(weapons.iter(), |mut b, w| {
+                        b.push_bind(format!("{}", w.reference_id))
+                            .push_bind(format!("{}", w.values.unique_weapon_kills as u32))
+                            .push_bind(format!("{}", w.values.unique_weapon_precision_kills as u32))
+                            .push_bind(format!("{}", w.values.unique_weapon_kills_precision_kills))
+                            .push_bind(character_activity_stats_id);
+                    });
+
+                    query_builder.build().execute(&mut self.db).await?;
                 }
             }
         }
