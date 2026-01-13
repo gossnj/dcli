@@ -14,7 +14,7 @@ This directory contains the implementation of the dcli library declared in @/dcl
 
 **Primary Interface Files**:
 - **apiinterface.rs** (700+ lines): High-level async API facade. Methods like `retrieve_alltime_crucible_stats()`, `search_destiny_player()`, `retrieve_activities_page()`, `retrieve_current_activity()`. Uses ApiClient internally.
-- **activitystoreinterface.rs** (2373 lines): Massive SQLite interface managing activity database lifecycle. Key methods: `init_with_path()`, `sync_player()`, `retrieve_activities_summary()`, `add_player_to_sync()`, `fix_pgcr_data()` (lines 951-1050).
+- **activitystoreinterface.rs** (2600+ lines): SQLite interface managing activity database lifecycle. Key methods: `init_with_path()`, `sync_player()`, `sync_player_with_progress()`, `retrieve_activities_summary()`, `add_player_to_sync()`, `fix_pgcr_data()`.
 - **manifestinterface.rs** (400+ lines): Queries manifest.sqlite3 for definitions. Caches frequently accessed items. Methods: `get_activity_definition()`, `get_inventory_item_definition()`, `get_stat_definition()`.
 
 **Data Structure Files**:
@@ -39,11 +39,17 @@ This directory contains the implementation of the dcli library declared in @/dcl
 
 ### Things to Know
 
+**Sync Architecture** (activitystoreinterface.rs):
+- `SyncProgress` enum provides granular progress phases: `Starting`, `FetchingHistory`, `DownloadingActivities`, `SavingActivities`, `Complete`, `Failed`. Used by FFI layer for mobile app progress UI.
+- `sync_player_with_progress<F>()` accepts a progress callback invoked at each sync phase. Wraps `sync_member_with_progress()` which iterates characters.
+- Activity queue queries use `ORDER BY activity_id DESC` to prioritize recent games - ensures users see newest activities first if sync is interrupted.
+- `insert_activities_batch()` wraps multiple activity inserts in a single SQLite transaction for performance. Individual insert failures are logged but don't abort the batch.
+- PGCR_REQUEST_CHUNK_AMOUNT = 100 (increased from 50) controls concurrent API requests per batch.
+
 **activitystoreinterface.rs Critical Logic**:
-- `fix_pgcr_data()` (lines 951-1050): Transforms incorrect Competitive mode IDs when `director_activity_hash` matches known competitive values. Essential for Season 25+ data accuracy.
+- `fix_pgcr_data()`: Transforms incorrect Competitive mode IDs when `director_activity_hash` matches known competitive values. Essential for Season 25+ data accuracy.
 - Database operations use sqlx with SQLite, all async.
-- Progress reporting via indicatif ProgressBar for long-running syncs.
-- Concurrent PGCR requests chunked (PGCR_REQUEST_CHUNK_AMOUNT = 50).
+- Progress reporting via indicatif ProgressBar for CLI, callback-based for FFI.
 
 **Mode Enum** (enums/mode.rs): Contains 70+ mode variants covering all Crucible game types. Includes methods `is_crucible()`, `is_private()`, `from_id()`, `as_id()`. Modes can be compound (e.g., `AllPvP`, `AllPvPQuickplay`).
 

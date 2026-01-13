@@ -84,7 +84,7 @@ use dcli::apiinterface::ApiInterface;
 use dcli::enums::platform::Platform;
 use dcli::enums::mode::Mode;
 use dcli::crucible::PlayerName;
-use dcli::activitystoreinterface::ActivityStoreInterface;
+use dcli::activitystoreinterface::{ActivityStoreInterface, SyncProgress};
 use dcli::manifestinterface::ManifestInterface;
 use dcli::enums::character::CharacterClassSelection;
 use dcli::enums::moment::DateTimePeriod;
@@ -505,9 +505,33 @@ pub extern "C" fn dcli_store_sync_player_with_progress(
         return false;
     }
 
-    // Helper to send progress updates
-    let send_progress = |message: &str, current: u32, total: u32| {
+    // Helper to send progress updates from SyncProgress enum
+    let send_progress = move |progress: SyncProgress| {
         if let Some(cb) = callback {
+            let message = match &progress {
+                SyncProgress::Starting => "Starting sync...".to_string(),
+                SyncProgress::FetchingHistory {
+                    character_index,
+                    character_count,
+                    class_name,
+                } => format!(
+                    "Fetching history for {} ({}/{})",
+                    class_name, character_index, character_count
+                ),
+                SyncProgress::DownloadingActivities { current, total } => {
+                    format!("Downloading activities ({}/{})", current, total)
+                }
+                SyncProgress::SavingActivities { current, total } => {
+                    format!("Saving activities ({}/{})", current, total)
+                }
+                SyncProgress::Complete { total_synced } => {
+                    format!("Sync complete! {} activities synced", total_synced)
+                }
+                SyncProgress::Failed { message } => format!("Sync failed: {}", message),
+            };
+
+            let (_, current, total) = progress.to_progress_tuple();
+
             if let Ok(c_msg) = CString::new(message) {
                 cb(c_msg.as_ptr(), current, total, user_data);
             }
@@ -521,17 +545,20 @@ pub extern "C" fn dcli_store_sync_player_with_progress(
 
         runtime.block_on(async {
             info!("Starting sync for player: {}", name_str);
-            send_progress("Initializing sync...", 0, 100);
 
-            match store_ref.sync_player(&player_name).await {
-                Ok(_) => {
-                    info!("Successfully synced player: {}", name_str);
-                    send_progress("Sync complete!", 100, 100);
+            match store_ref
+                .sync_player_with_progress(&player_name, send_progress)
+                .await
+            {
+                Ok(result) => {
+                    info!(
+                        "Successfully synced player: {} ({} activities)",
+                        name_str, result.total_synced
+                    );
                     true
-                },
+                }
                 Err(e) => {
                     error!("Failed to sync player {}: {:?}", name_str, e);
-                    send_progress(&format!("Sync failed: {:?}", e), 0, 100);
                     false
                 }
             }

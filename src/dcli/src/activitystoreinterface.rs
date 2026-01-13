@@ -82,7 +82,8 @@ const STORE_DB_SCHEMA: &str = include_str!("../actitvity_store_schema.sql");
 const DCLI_FIX_DATA: &str = "DCLI_FIX_DATA";
 
 //number of simultaneous requests we make to server when retrieving activity history
-const PGCR_REQUEST_CHUNK_AMOUNT: usize = 50;
+//Increased from 50 to 100 for better throughput on large syncs
+const PGCR_REQUEST_CHUNK_AMOUNT: usize = 100;
 
 const DB_SCHEMA_VERSION: i32 = 10;
 const NO_TEAMS_INDEX: i32 = 253;
@@ -305,6 +306,44 @@ impl ActivityStoreInterface {
         Ok(out)
     }
 
+    /// Sync a player with granular progress reporting.
+    /// The callback is invoked at each major phase of the sync operation.
+    pub async fn sync_player_with_progress<F>(
+        &mut self,
+        player: &PlayerName,
+        on_progress: F,
+    ) -> Result<SyncResult, Error>
+    where
+        F: Fn(SyncProgress),
+    {
+        on_progress(SyncProgress::Starting);
+
+        let member = match self.find_member(player, false).await {
+            Ok(m) => m,
+            Err(e) => {
+                on_progress(SyncProgress::Failed {
+                    message: format!("{:?}", e),
+                });
+                return Err(e);
+            }
+        };
+
+        match self.sync_member_with_progress(&member, &on_progress).await {
+            Ok(result) => {
+                on_progress(SyncProgress::Complete {
+                    total_synced: result.total_synced,
+                });
+                Ok(result)
+            }
+            Err(e) => {
+                on_progress(SyncProgress::Failed {
+                    message: format!("{:?}", e),
+                });
+                Err(e)
+            }
+        }
+    }
+
     //select all members where sync member = memberid
     pub async fn sync_all(&mut self) -> Result<(), Error> {
         let members: Vec<Member> = self.get_sync_members().await?;
@@ -517,6 +556,71 @@ impl ActivityStoreInterface {
         })
     }
 
+    /// Sync member with progress reporting callback.
+    async fn sync_member_with_progress<F>(
+        &mut self,
+        member: &Member,
+        on_progress: &F,
+    ) -> Result<SyncResult, Error>
+    where
+        F: Fn(SyncProgress),
+    {
+        let player_info = self
+            .api_interface
+            .get_player_info(&member.id, &member.platform)
+            .await?;
+
+        let characters = player_info.characters;
+
+        self.insert_member(&player_info.user_info.to_member())
+            .await?;
+
+        let mut total_synced = 0;
+        let mut total_in_queue = 0;
+        let character_count = characters.characters.len() as u8;
+
+        tell::update!(
+            "CHECKING FOR NEW ACTIVITIES FOR {} (PUBLIC AND PRIVATE)",
+            member.name.get_bungie_name()
+        );
+
+        for (index, c) in characters.characters.iter().enumerate() {
+            let character_id = &c.id;
+            self.insert_character(&c.id, &c.class_type, member).await?;
+
+            on_progress(SyncProgress::FetchingHistory {
+                character_index: index as u8 + 1,
+                character_count,
+                class_name: format!("{}", c.class_type).to_uppercase(),
+            });
+
+            tell::progress!("{}", format!("[{}]", c.class_type).to_uppercase());
+
+            let a = self
+                .sync_activities_with_progress(character_id, on_progress)
+                .await?;
+
+            let _b = self
+                .update_activity_queue(&member.id, character_id, &member.platform)
+                .await?;
+
+            let c_result = self
+                .sync_activities_with_progress(character_id, on_progress)
+                .await?;
+
+            total_synced += a.total_synced + c_result.total_synced;
+            total_in_queue += (a.total_available + c_result.total_available)
+                - (a.total_synced + c_result.total_synced);
+        }
+
+        self.update_sync_entry(&member.id).await?;
+
+        Ok(SyncResult {
+            total_synced,
+            total_available: total_in_queue,
+        })
+    }
+
     /// download results from ids in queue, and return number of items synced
     async fn sync_activities(
         &mut self,
@@ -534,6 +638,8 @@ impl ActivityStoreInterface {
                         "activity_queue"
                     WHERE
                         character = ? AND synced = 0
+                    ORDER BY
+                        activity_id DESC
                 "#,
             )
             .bind(character_id)
@@ -599,47 +705,168 @@ impl ActivityStoreInterface {
 
             //tell::progress!(".");
 
-            //TODO: look into using threading for this
             let results = futures::future::join_all(f).await;
 
-            //loop through. if we get results. grab those, otherwise, we ignore
-            //any errors, as that will keep the IDs in the queue to try next time
-            //TODO: this is a mess. can we simpify and not nest so deeply?
+            // Collect successful PGCR fetches for batch insert
+            let mut activities_to_insert: Vec<DestinyPostGameCarnageReportData> =
+                Vec::with_capacity(results.len());
+
             for r in results {
                 match r {
-                    Ok(e) => {
-                        match e {
-                            Some(mut e) => match self
-                                .insert_activity(&mut e, character_id)
-                                .await
-                            {
-                                Ok(_e) => {
-                                    total_synced += 1;
-                                }
-                                Err(e) => {
-                                    tell::error!(
-                                        "Error inserting data into character activity stats table. Skipping. : {}",
-                                        e,
-                                    );
-                                }
-                            },
-                            None => {
-                                tell::error!(
-                                    "PGCR returned empty response. Ignoring."
-                                );
-                                //TODO: should not get here, as none means either an API error
-                                //occured or there is no data associated with the ID (which is
-                                //an api data error).
-                                //we will just ignore it here, with the assumption that any error
-                                //is temporary, and will be fixed next time we sync
-                            }
-                        }
+                    Ok(Some(e)) => activities_to_insert.push(e),
+                    Ok(None) => {
+                        tell::error!("PGCR returned empty response. Ignoring.");
                     }
                     Err(_) => {
                         tell::error!(
-                            "Error retrieving activity details from api. Skipping.");
+                            "Error retrieving activity details from api. Skipping."
+                        );
                     }
                 }
+            }
+
+            // Batch insert all fetched activities in a single transaction
+            if !activities_to_insert.is_empty() {
+                total_synced += self
+                    .insert_activities_batch(&mut activities_to_insert, character_id)
+                    .await?;
+            }
+        }
+
+        pb.finish_and_clear();
+
+        if !ids.is_empty() {
+            sqlx::query("PRAGMA OPTIMIZE;")
+                .execute(&mut self.db)
+                .await?;
+        }
+
+        Ok(SyncResult {
+            total_available,
+            total_synced,
+        })
+    }
+
+    /// Download and sync activities with progress reporting
+    async fn sync_activities_with_progress<F>(
+        &mut self,
+        character_id: &i64,
+        on_progress: &F,
+    ) -> Result<SyncResult, Error>
+    where
+        F: Fn(SyncProgress),
+    {
+        let mut ids: Vec<i64> = Vec::new();
+
+        {
+            let mut rows = sqlx::query(
+                r#"
+                    SELECT
+                        "activity_id"
+                    FROM
+                        "activity_queue"
+                    WHERE
+                        character = ? AND synced = 0
+                    ORDER BY
+                        activity_id DESC
+                "#,
+            )
+            .bind(character_id)
+            .fetch(&mut self.db);
+
+            while let Some(row) = rows.try_next().await? {
+                let activity_id: i64 = row.try_get("activity_id")?;
+                ids.push(activity_id);
+            }
+        };
+
+        if ids.is_empty() {
+            return Ok(SyncResult {
+                total_available: 0,
+                total_synced: 0,
+            });
+        }
+
+        let mut filtered_ids = Vec::new();
+
+        for id in ids {
+            if self.has_activity(&id).await {
+                self.remove_from_activity_queue(character_id, &id).await?;
+                continue;
+            } else {
+                filtered_ids.push(id)
+            }
+        }
+        ids = filtered_ids;
+
+        let total_available = ids.len() as u32;
+        let mut total_synced = 0;
+
+        use std::fmt::Write;
+
+        let pb = if Tell::is_active(TellLevel::Progress) {
+            ProgressBar::new(ids.len() as u64)
+        } else {
+            ProgressBar::hidden()
+        };
+
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {human_pos}/{human_len} ETA:({eta_precise})",
+            )
+            .unwrap()
+            .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
+                write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap()
+            })
+            .progress_chars("#>-"),
+        );
+
+        let mut downloaded_count: u32 = 0;
+        for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
+            // Report downloading progress
+            on_progress(SyncProgress::DownloadingActivities {
+                current: downloaded_count,
+                total: total_available,
+            });
+
+            let mut f = Vec::new();
+
+            for c in id_chunks {
+                f.push(self.api_interface.retrieve_post_game_carnage_report(*c));
+            }
+
+            downloaded_count += id_chunks.len() as u32;
+            pb.set_position(downloaded_count as u64);
+
+            let results = futures::future::join_all(f).await;
+
+            let mut activities_to_insert: Vec<DestinyPostGameCarnageReportData> =
+                Vec::with_capacity(results.len());
+
+            for r in results {
+                match r {
+                    Ok(Some(e)) => activities_to_insert.push(e),
+                    Ok(None) => {
+                        tell::error!("PGCR returned empty response. Ignoring.");
+                    }
+                    Err(_) => {
+                        tell::error!(
+                            "Error retrieving activity details from api. Skipping."
+                        );
+                    }
+                }
+            }
+
+            // Report saving progress
+            if !activities_to_insert.is_empty() {
+                on_progress(SyncProgress::SavingActivities {
+                    current: total_synced,
+                    total: total_available,
+                });
+
+                total_synced += self
+                    .insert_activities_batch(&mut activities_to_insert, character_id)
+                    .await?;
             }
         }
 
@@ -816,25 +1043,41 @@ impl ActivityStoreInterface {
         }
     }
 
-    async fn insert_activity(
+    /// Batch insert multiple activities in a single transaction for improved performance.
+    /// Returns the count of successfully inserted activities.
+    /// Failed inserts are logged but don't stop the batch - those activities remain
+    /// in the queue for retry on next sync.
+    async fn insert_activities_batch(
         &mut self,
-        data: &mut DestinyPostGameCarnageReportData,
+        activities: &mut [DestinyPostGameCarnageReportData],
         character_id: &i64,
-    ) -> Result<(), Error> {
-        sqlx::query("BEGIN TRANSACTION;")
-            .execute(&mut self.db)
-            .await?;
+    ) -> Result<u32, Error> {
+        if activities.is_empty() {
+            return Ok(0);
+        }
 
-        match self._insert_activity(data, character_id).await {
-            Ok(_e) => {
-                sqlx::query("COMMIT;").execute(&mut self.db).await?;
-                Ok(())
-            }
-            Err(e) => {
-                sqlx::query("ROLLBACK;").execute(&mut self.db).await?;
-                Err(e)
+        self.begin_transaction().await?;
+
+        let mut success_count: u32 = 0;
+        for activity in activities.iter_mut() {
+            match self._insert_activity(activity, character_id).await {
+                Ok(_) => {
+                    success_count += 1;
+                }
+                Err(e) => {
+                    // Log error but continue with batch - activity stays in queue for retry
+                    tell::error!(
+                        "Error inserting activity {}. Skipping: {}",
+                        activity.activity_details.instance_id,
+                        e
+                    );
+                }
             }
         }
+
+        self.commit_transaction().await?;
+
+        Ok(success_count)
     }
 
     fn remove_from_modes(
@@ -2368,6 +2611,56 @@ impl std::ops::Add<SyncResult> for SyncResult {
         SyncResult {
             total_available: self.total_available + sr.total_available,
             total_synced: self.total_synced + sr.total_synced,
+        }
+    }
+}
+
+/// Progress updates during sync operations.
+/// Designed to provide granular feedback for mobile apps.
+#[derive(Debug, Clone)]
+pub enum SyncProgress {
+    /// Starting sync for a player
+    Starting,
+    /// Fetching activity history for a character
+    FetchingHistory {
+        character_index: u8,
+        character_count: u8,
+        class_name: String,
+    },
+    /// Downloading activity details (PGCRs)
+    DownloadingActivities { current: u32, total: u32 },
+    /// Saving activities to database
+    SavingActivities { current: u32, total: u32 },
+    /// Sync completed successfully
+    Complete { total_synced: u32 },
+    /// Sync failed with error
+    Failed { message: String },
+}
+
+impl SyncProgress {
+    /// Convert to a simple (message, current, total) tuple for FFI compatibility
+    pub fn to_progress_tuple(&self) -> (&str, u32, u32) {
+        match self {
+            SyncProgress::Starting => ("Starting sync...", 0, 100),
+            SyncProgress::FetchingHistory {
+                character_index,
+                character_count,
+                class_name,
+            } => {
+                // We'll return static str, caller can format if needed
+                let _ = (character_index, character_count, class_name);
+                ("Fetching activity history...", 0, 100)
+            }
+            SyncProgress::DownloadingActivities { current, total } => {
+                ("Downloading activities...", *current, *total)
+            }
+            SyncProgress::SavingActivities { current, total } => {
+                ("Saving to database...", *current, *total)
+            }
+            SyncProgress::Complete { total_synced } => {
+                ("Sync complete!", *total_synced, *total_synced)
+            }
+            SyncProgress::Failed { .. } => ("Sync failed", 0, 100),
         }
     }
 }

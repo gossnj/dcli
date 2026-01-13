@@ -4,22 +4,22 @@ Path: @/dcli/src/dcli-ffi/src
 
 ### Overview
 
-Contains the single-file implementation of C FFI bindings exposing Rust dcli functionality to Swift applications.
+Contains the single-file implementation of C FFI bindings exposing Rust dcli functionality to Swift/Kotlin applications on iOS and Android.
 
 ### How it fits into the larger codebase
 
-This is the implementation layer called by @/Last Banner Swift code through C interop. The source here wraps @/dcli/src/dcli library calls, manages tokio runtimes for blocking FFI compatibility, and handles all C type conversions (pointers, structs, strings). Changes here directly affect the Swift API surface at @/Last Banner/Services/DcliDatabaseService.swift.
+This is the implementation layer called by mobile apps through C interop. The source here wraps @/dcli/src/dcli library calls, manages tokio runtimes for blocking FFI compatibility, and handles all C type conversions (pointers, structs, strings). Changes here directly affect the Swift API surface at @/Last Banner/Services/DcliDatabaseService.swift. Platform-specific logging uses OSLog on Apple platforms and android_logger on Android.
 
 ### Core Implementation
 
-**Single File Architecture** (@/dcli/src/dcli-ffi/src/lib.rs): All 884 lines in one file, organized by functional area with MARK comments.
+**Single File Architecture** (@/dcli/src/dcli-ffi/src/lib.rs): ~988 lines in one file, organized by functional area with MARK comments.
 
 **Sections**:
-1. **Imports and Type Definitions** (lines 1-35): Use statements, opaque handle structs, C-repr structs
-2. **API Client Functions** (lines 36-261): Player search and stats retrieval from Bungie API
-3. **Activity Store Functions** (lines 263-617): Database operations for syncing and querying activities
-4. **Manifest Management** (lines 619-864): Manifest download and update checking
-5. **Utility Functions** (lines 866-883): String memory management and error retrieval
+1. **Platform Logging** (lines 36-78): Conditional compilation for iOS (OSLog), Android (android_logger), or no-op. Filters sqlx query spam to Warn level.
+2. **API Client Functions**: Player search and stats retrieval from Bungie API
+3. **Activity Store Functions**: Database operations for syncing and querying activities
+4. **Manifest Management**: Manifest download and update checking with 2-minute timeout
+5. **Utility Functions**: String memory management and error retrieval
 
 **Memory Management Pattern**:
 ```rust
@@ -38,43 +38,26 @@ let result = runtime.block_on(async {
 ```
 Each opaque handle struct contains its own `tokio::runtime::Runtime` to execute async dcli library calls synchronously.
 
-**Pointer Safety Pattern**:
+**Progress Callback Type**:
 ```rust
-if client.is_null() || bungie_name.is_null() || out_stats.is_null() {
-    return false;
-}
+pub type ProgressCallback = extern "C" fn(*const c_char, u32, u32, *mut std::ffi::c_void);
 ```
-Every FFI function validates all pointer parameters before use.
-
-**String Handling**:
-```rust
-// Input: Swift C string -> Rust &str
-let name_str = unsafe {
-    match CStr::from_ptr(bungie_name).to_str() {
-        Ok(s) => s,
-        Err(_) => return false,
-    }
-};
-
-// Output: Rust String -> C string (caller must free)
-let c_msg = CString::new(message)?;
-cb(c_msg.as_ptr(), current, total, user_data);
-```
+Receives formatted message, current count, total count, and user data pointer.
 
 ### Things to Know
 
-**No Fine-Grained Error Reporting**: Functions return bool/i32 for success. Internal Error details logged via eprintln! but not propagated to Swift. `dcli_get_last_error()` stub exists (line 880) but returns null.
+**Granular Progress Reporting**: `dcli_store_sync_player_with_progress()` converts `SyncProgress` enum variants to human-readable messages for mobile UI:
+- "Starting sync..." / "Fetching history for WARLOCK (2/3)" / "Downloading activities (150/500)" / "Saving activities (150/500)" / "Sync complete! 500 activities synced"
+- Progress callback invoked on the same thread that called FFI; Swift/Kotlin must not block.
 
-**Progress Callback Threading**: Sync operations like `dcli_store_sync_player_with_progress()` call progress callback on same thread that invoked FFI. Swift must not block in callback.
+**No Fine-Grained Error Reporting**: Functions return bool/i32 for success. Error details logged via platform logger (info!/error! macros) but not propagated to caller. `dcli_get_last_error()` stub exists but returns null.
 
-**Database Stat Queries**: `dcli_store_get_crucible_stats()` hardcodes all-time period (lines 534-540) as 10 years in the past to now. Does not expose configurable time periods to Swift.
+**Database Stat Queries**: `dcli_store_get_crucible_stats()` hardcodes all-time period as 10 years in the past to now. Does not expose configurable time periods.
 
 **Manifest Path Convention**: Functions expect `data_dir` containing `manifest.sqlite3` and `manifest_info.json`. Must match dcli library expectations.
 
-**Runtime Creation Overhead**: Each `_init()` or `_new()` call creates a new tokio runtime. For many operations, this is acceptable; for high-frequency calls, consider pooling on Swift side.
+**Runtime Creation Overhead**: Each `_init()` or `_new()` call creates a new tokio runtime. For many operations, this is acceptable; for high-frequency calls, consider pooling on the app side.
 
 **Unsafe Blocks**: Extensive use of `unsafe {}` for FFI pointer operations. Safety ensured by null checks and proper Box ownership transfer. All unsafe blocks are necessary for C interop.
-
-**eprintln! Debugging**: Sync and manifest operations print status to stderr (lines 462-474, 754-859). Useful for debugging but not production logging.
 
 Created and maintained by Nori.
