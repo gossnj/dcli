@@ -1780,7 +1780,7 @@ impl ActivityStoreInterface {
             ORDER BY activity.period DESC LIMIT 1
         "#,
         )
-        .bind(mode.as_id().to_string()) // Must match storage format (stored as string)
+        .bind(mode.as_id())
         .bind(character_id)
         .bind(character_id)
         .fetch_all(&mut self.db)
@@ -2160,7 +2160,7 @@ impl ActivityStoreInterface {
         .bind(class_id)
         .bind(time_period.get_start().to_rfc3339())
         .bind(time_period.get_end().to_rfc3339())
-        .bind(mode.as_id().to_string()) // Must match storage format (stored as string)
+        .bind(mode.as_id())
         .bind(restrict_mode_id)
         .fetch_one(&mut self.db)
         .await?;
