@@ -643,8 +643,14 @@ impl ApiInterface {
             //move the items from the temp vec to the out
             out.append(&mut t);
 
-            if should_break || len < count {
+            if should_break {
                 break;
+            }
+
+            // Don't break on partial pages - Bungie API sometimes returns < 250 even when
+            // there's more history. Continue until we find our target time or get 0 activities.
+            if len < count {
+                tell::update!("DEBUG: Page {} had {} activities (< {}), continuing anyway. Total: {}", page, len, count, out.len());
             }
 
             page += 1;
@@ -740,11 +746,14 @@ impl ApiInterface {
                 out.push(activity);
             }
 
-            if should_break || len < count {
-                if !should_break && len < count {
-                    tell::update!("DEBUG: Page {} had {} activities (< {}), assuming end of history. Total: {}", page, len, count, out.len());
-                }
+            if should_break {
                 break;
+            }
+
+            // Don't break on partial pages - Bungie API sometimes returns < 250 even when
+            // there's more history. Continue until we get None or 0 activities.
+            if len < count {
+                tell::update!("DEBUG: Page {} had {} activities (< {}), continuing anyway. Total: {}", page, len, count, out.len());
             }
 
             page += 1;
@@ -754,8 +763,7 @@ impl ApiInterface {
                 HumanCount(out.len() as u64)
             ));
 
-            //if we try to page past where there is valid data, bungie will return
-            //empty response, which we detect retrieve_activities (and returns None)
+            // When we truly exhaust the data, Bungie returns empty response (None) or 0 activities
         }
 
         pb.finish_and_clear();
