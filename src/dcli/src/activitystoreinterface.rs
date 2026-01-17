@@ -941,6 +941,7 @@ impl ActivityStoreInterface {
         mode: &Mode,
     ) -> Result<SyncResult, Error> {
         let max_id: i64 = self.get_max_activity_id(character_id, mode).await?;
+        tell::update!("DEBUG: _update_activity_queue mode={:?} max_id={} character_id={}", mode, max_id, character_id);
 
         let result = self
             .api_interface
@@ -954,6 +955,7 @@ impl ActivityStoreInterface {
             .await?;
 
         if result.is_none() {
+            tell::update!("DEBUG: No activities found for mode={:?}", mode);
             return Ok(SyncResult {
                 total_available: 0,
                 total_synced: 0,
@@ -961,7 +963,7 @@ impl ActivityStoreInterface {
         }
 
         let mut activities = result.unwrap();
-        //tell::progress!(format!("{} new activities found", activities.len()));
+        tell::update!("DEBUG: Found {} activities for mode={:?}", activities.len(), mode);
 
         //reverse them so we add the oldest first
         activities.reverse();

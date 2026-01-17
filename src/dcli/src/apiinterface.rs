@@ -689,6 +689,7 @@ impl ApiInterface {
         pb.set_message("Searching for new activities.");
 
         //TODO: if error occurs on an individual call, retry?
+        tell::update!("DEBUG: Starting activity fetch, looking for activity_id={}", activity_id);
         loop {
             //tell::progress!(".");
             io::stderr().flush().unwrap();
@@ -714,6 +715,7 @@ impl ApiInterface {
             pb.inc(1);
 
             if activities.is_none() {
+                tell::update!("DEBUG: Page {} returned None, breaking. Total so far: {}", page, out.len());
                 break;
             }
 
@@ -723,12 +725,14 @@ impl ApiInterface {
 
             //todo: this seems redundant from check above
             if len == 0 {
+                tell::update!("DEBUG: Page {} returned 0 activities, breaking. Total so far: {}", page, out.len());
                 break;
             }
 
             let mut should_break = false;
             for activity in t.into_iter() {
                 if activity.details.instance_id == activity_id {
+                    tell::update!("DEBUG: Found target activity_id={} on page {}, breaking. Total: {}", activity_id, page, out.len());
                     should_break = true;
                     break;
                 }
@@ -737,6 +741,9 @@ impl ApiInterface {
             }
 
             if should_break || len < count {
+                if !should_break && len < count {
+                    tell::update!("DEBUG: Page {} had {} activities (< {}), assuming end of history. Total: {}", page, len, count, out.len());
+                }
                 break;
             }
 
