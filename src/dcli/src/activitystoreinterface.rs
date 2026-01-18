@@ -22,7 +22,21 @@
 
 use std::str::FromStr;
 use std::{collections::HashMap, path::Path};
+use std::fs::OpenOptions;
+use std::io::Write;
 use tell::{Tell, TellLevel};
+
+// Debug logging to file for sync investigation
+fn debug_log(message: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/dcli_sync_debug.log")
+    {
+        let timestamp = chrono::Utc::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(file, "[{}] {}", timestamp, message);
+    }
+}
 
 use chrono::{DateTime, Utc};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
@@ -522,31 +536,43 @@ impl ActivityStoreInterface {
         );
         tell::progress!("This may take a few minutes depending on the number of activities.");
 
-        for c in characters.characters {
-            let character_id = &c.id;
-            self.insert_character(&c.id, &c.class_type, &member).await?;
-            tell::progress!("{}", format!("[{}]", c.class_type).to_uppercase());
+        debug_log(&format!("=== SYNC MEMBER START: {} ===", member.name.get_bungie_name()));
+        for char_info in characters.characters {
+            let character_id = &char_info.id;
+            self.insert_character(&char_info.id, &char_info.class_type, &member).await?;
+            tell::progress!("{}", format!("[{}]", char_info.class_type).to_uppercase());
+
+            debug_log(&format!("--- CHARACTER {} ({}) ---", char_info.class_type, character_id));
 
             //these calls could be a little more general purpose by taking api ids and not db ids.
             //however, passing the db ids, lets us optimize a lot of the sql, and avoid
             //some extra calls to the DB
 
-            let a = self.sync_activities(character_id).await?;
+            debug_log("Step 1: sync_activities (pre-queue)");
+            let sync_result_a = self.sync_activities(character_id).await?;
+            debug_log(&format!("Step 1 result: synced={}, available={}", sync_result_a.total_synced, sync_result_a.total_available));
 
-            let _b = self
+            debug_log("Step 2: update_activity_queue");
+            let queue_result = self
                 .update_activity_queue(
                     &member.id,
                     character_id,
                     &member.platform,
                 )
                 .await?;
+            debug_log(&format!("Step 2 result: synced={}, available={}", queue_result.total_synced, queue_result.total_available));
 
-            let c = self.sync_activities(character_id).await?;
+            debug_log("Step 3: sync_activities (post-queue)");
+            let sync_result_b = self.sync_activities(character_id).await?;
+            debug_log(&format!("Step 3 result: synced={}, available={}", sync_result_b.total_synced, sync_result_b.total_available));
 
-            total_synced += a.total_synced + c.total_synced;
-            total_in_queue += (a.total_available + c.total_available)
-                - (a.total_synced + c.total_synced);
+            total_synced += sync_result_a.total_synced + sync_result_b.total_synced;
+            total_in_queue += (sync_result_a.total_available + sync_result_b.total_available)
+                - (sync_result_a.total_synced + sync_result_b.total_synced);
+
+            debug_log(&format!("Character {} done: total_synced so far={}", char_info.class_type, total_synced));
         }
+        debug_log(&format!("=== SYNC MEMBER END: total_synced={} ===", total_synced));
 
         self.update_sync_entry(&member.id).await?;
 
@@ -940,7 +966,9 @@ impl ActivityStoreInterface {
         platform: &Platform,
         mode: &Mode,
     ) -> Result<SyncResult, Error> {
+        debug_log(&format!("_update_activity_queue: mode={:?} character_id={}", mode, character_id));
         let max_id: i64 = self.get_max_activity_id(character_id, mode).await?;
+        debug_log(&format!("  -> max_id returned: {}", max_id));
         tell::update!("DEBUG: _update_activity_queue mode={:?} max_id={} character_id={}", mode, max_id, character_id);
 
         let result = self
@@ -955,6 +983,7 @@ impl ActivityStoreInterface {
             .await?;
 
         if result.is_none() {
+            debug_log(&format!("  -> API returned None for mode={:?}", mode));
             tell::update!("DEBUG: No activities found for mode={:?}", mode);
             return Ok(SyncResult {
                 total_available: 0,
@@ -963,10 +992,20 @@ impl ActivityStoreInterface {
         }
 
         let mut activities = result.unwrap();
+        debug_log(&format!("  -> API returned {} activities for mode={:?}", activities.len(), mode));
         tell::update!("DEBUG: Found {} activities for mode={:?}", activities.len(), mode);
 
         //reverse them so we add the oldest first
         activities.reverse();
+
+        // DEBUG: Count queue size before insert
+        let queue_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ?"
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
 
         // TODO: think through this
         // Right now, we do all inserts in one transaction. This gives a significant performance
@@ -1026,6 +1065,21 @@ impl ActivityStoreInterface {
             };
         }
         sqlx::query("COMMIT;").execute(&mut self.db).await?;
+
+        // DEBUG: Count queue size after insert
+        let queue_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ?"
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        let actually_inserted = queue_after - queue_before;
+        debug_log(&format!("  -> Queue insert: before={} after={} inserted={} (tried {})",
+            queue_before, queue_after, actually_inserted, total));
+        tell::update!("DEBUG: Queue insert complete. Before={} After={} Actually inserted={} (tried to insert {})",
+            queue_before, queue_after, actually_inserted, total);
 
         Ok(SyncResult {
             total_available: total,
@@ -1353,6 +1407,38 @@ impl ActivityStoreInterface {
             was_updated = self.fix_private_match(activity);
         }
 
+        // CRITICAL FIX: Ensure parent modes are present for proper stats querying
+        // The Bungie API returns activities when querying by mode (e.g., AllPvP=5),
+        // but the PGCR's modes array may not include that parent mode.
+        // This causes activities to be synced but not counted in stats queries.
+
+        let has_all_pvp = activity.activity_details.modes.iter().any(|m| *m == Mode::AllPvP);
+        let is_private = activity.activity_details.is_private;
+
+        // Add AllPvP (mode 5) to all non-private Crucible activities that don't have it
+        if !has_all_pvp && !is_private {
+            // Use canonical is_crucible() to detect PvP activities
+            let is_pvp_activity = activity.activity_details.modes.iter().any(|m| m.is_crucible());
+
+            if is_pvp_activity {
+                debug_log(&format!("FIX: Adding AllPvP to activity {} (modes: {:?})",
+                    activity.activity_details.instance_id,
+                    activity.activity_details.modes.iter().map(|m| m.as_id()).collect::<Vec<_>>()));
+                self.add_to_modes(activity, Mode::AllPvP);
+                was_updated = true;
+            }
+        }
+
+        // Ensure PrivateMatchesAll (mode 32) is present for private matches
+        let has_private_all = activity.activity_details.modes.iter().any(|m| *m == Mode::PrivateMatchesAll);
+        if !has_private_all && is_private {
+            debug_log(&format!("FIX: Adding PrivateMatchesAll to activity {} (modes: {:?})",
+                activity.activity_details.instance_id,
+                activity.activity_details.modes.iter().map(|m| m.as_id()).collect::<Vec<_>>()));
+            self.add_to_modes(activity, Mode::PrivateMatchesAll);
+            was_updated = true;
+        }
+
         was_updated
     }
 
@@ -1404,6 +1490,17 @@ impl ActivityStoreInterface {
         }
 
         //TODO: Rumble will have no teams. Need to create one
+
+        // DEBUG: Check if AllPvP (5) or PrivateMatchesAll (32) are in modes
+        let has_all_pvp = data.activity_details.modes.iter().any(|m| *m == Mode::AllPvP);
+        let has_private_all = data.activity_details.modes.iter().any(|m| *m == Mode::PrivateMatchesAll);
+        let mode_ids: Vec<u32> = data.activity_details.modes.iter().map(|m| m.as_id()).collect();
+
+        // Only log first few to avoid spam - log if missing expected parent modes
+        if !has_all_pvp && !has_private_all {
+            tell::update!("DEBUG: Activity {} has NO parent mode (AllPvP or PrivateMatchesAll). Modes: {:?}",
+                activity_id, mode_ids);
+        }
 
         for mode in &data.activity_details.modes {
             sqlx::query(
@@ -1765,6 +1862,44 @@ impl ActivityStoreInterface {
         character_id: &i64,
         mode: &Mode,
     ) -> Result<i64, Error> {
+        // DEBUG: Count activities in queue for this character
+        let queue_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ?"
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        // DEBUG: Count synced activities for this character
+        let synced_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ? AND synced = 1"
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        // DEBUG: Count activities with this specific mode
+        let mode_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(DISTINCT modes.activity)
+            FROM modes
+            INNER JOIN activity_queue ON modes.activity = activity_queue.activity_id
+            WHERE activity_queue.character = ? AND modes.mode = ?
+            "#
+        )
+        .bind(character_id)
+        .bind(mode.as_id())
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        debug_log(&format!("get_max_activity_id: char={} mode={:?}({}) queue={} synced={} with_mode={}",
+            character_id, mode, mode.as_id(), queue_count, synced_count, mode_count));
+        tell::update!("DEBUG: get_max_activity_id char={} mode={:?}({}) queue_total={} synced={} with_mode={}",
+            character_id, mode, mode.as_id(), queue_count, synced_count, mode_count);
+
         let rows = sqlx::query(
             r#"
             SELECT
@@ -1789,11 +1924,16 @@ impl ActivityStoreInterface {
         .await?;
 
         if rows.is_empty() {
+            debug_log("  -> returning 0 (no matching rows)");
+            tell::update!("DEBUG: get_max_activity_id returning 0 (no matching rows)");
             return Ok(0);
         }
 
         let row = &rows[0];
         let activity_id: i64 = row.try_get("max_activity_id")?;
+        debug_log(&format!("  -> returning {}", activity_id));
+
+        tell::update!("DEBUG: get_max_activity_id returning {}", activity_id);
 
         Ok(activity_id)
     }
