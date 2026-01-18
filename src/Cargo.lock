@@ -487,6 +487,7 @@ dependencies = [
  "sqlx",
  "static_assertions",
  "tell",
+ "tokio",
  "zip",
 ]
 

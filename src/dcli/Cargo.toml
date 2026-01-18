@@ -28,6 +28,7 @@ zip = "0.5.13"
 chrono = "0.4.23"
 percent-encoding = "2.1.0"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["time"] }
 futures = "0.3.25"
 static_assertions = "1.1.0"
 crossterm = "0.20.0"

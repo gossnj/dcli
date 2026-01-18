@@ -96,8 +96,8 @@ const STORE_DB_SCHEMA: &str = include_str!("../actitvity_store_schema.sql");
 const DCLI_FIX_DATA: &str = "DCLI_FIX_DATA";
 
 //number of simultaneous requests we make to server when retrieving activity history
-//Increased from 50 to 100 for better throughput on large syncs
-const PGCR_REQUEST_CHUNK_AMOUNT: usize = 100;
+//Reduced from 100 to 25 to avoid Bungie API rate limiting
+const PGCR_REQUEST_CHUNK_AMOUNT: usize = 25;
 
 const DB_SCHEMA_VERSION: i32 = 10;
 const NO_TEAMS_INDEX: i32 = 253;

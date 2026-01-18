@@ -44,7 +44,8 @@ This directory contains the implementation of the dcli library declared in @/dcl
 - `sync_player_with_progress<F>()` accepts a progress callback invoked at each sync phase. Wraps `sync_member_with_progress()` which iterates characters.
 - Activity queue queries use `ORDER BY activity_id DESC` to prioritize recent games - ensures users see newest activities first if sync is interrupted.
 - `insert_activities_batch()` wraps multiple activity inserts in a single SQLite transaction for performance. Individual insert failures are logged but don't abort the batch.
-- PGCR_REQUEST_CHUNK_AMOUNT = 100 (increased from 50) controls concurrent API requests per batch.
+- PGCR_REQUEST_CHUNK_AMOUNT = 25 (reduced from 100) controls concurrent API requests per batch. Lower values avoid Bungie API rate limiting.
+- `retrieve_post_game_carnage_report()` includes retry logic with exponential backoff (3 retries, 100ms/200ms/400ms delays) to handle transient API failures.
 
 **activitystoreinterface.rs Critical Logic**:
 - `fix_pgcr_data()`: Transforms incorrect Competitive mode IDs when `director_activity_hash` matches known competitive values. Essential for Season 25+ data accuracy.

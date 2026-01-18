@@ -842,31 +842,57 @@ impl ApiInterface {
         &self,
         instance_id: i64,
     ) -> Result<Option<DestinyPostGameCarnageReportData>, Error> {
-        //TODO: do we need to use baseurls?
         let url = format!(
             "{base}/Platform/Destiny2/Stats/PostGameCarnageReport/{instance_id}/",
             base = PGCR_BASE_URL,
             instance_id = instance_id,
         );
 
-        let response: PGCRResponse =
-            self.client.call_and_parse::<PGCRResponse>(&url).await?;
+        // Retry logic with exponential backoff for transient failures
+        const MAX_RETRIES: u32 = 3;
+        const BASE_DELAY_MS: u64 = 100;
 
-        let data: DestinyPostGameCarnageReportData = match response.response {
-            Some(e) => e,
-            None => {
-                if response.status.error_code == API_RESPONSE_STATUS_SUCCESS {
-                    return Ok(None);
-                } else {
-                    return Err(Error::ApiRequest {
-                        description: String::from(
-                            "No response data from API Call.",
-                        ),
-                    });
+        let mut last_error: Option<Error> = None;
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                // Exponential backoff: 100ms, 200ms, 400ms
+                let delay = BASE_DELAY_MS * (1 << attempt);
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+            }
+
+            match self.client.call_and_parse::<PGCRResponse>(&url).await {
+                Ok(response) => {
+                    let data: DestinyPostGameCarnageReportData = match response.response {
+                        Some(e) => e,
+                        None => {
+                            if response.status.error_code == API_RESPONSE_STATUS_SUCCESS {
+                                return Ok(None);
+                            } else {
+                                // API returned error status - retry
+                                last_error = Some(Error::ApiRequest {
+                                    description: format!(
+                                        "API error code {} for PGCR {}",
+                                        response.status.error_code, instance_id
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    };
+                    return Ok(Some(data));
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    // Network/parse error - retry
+                    continue;
                 }
             }
-        };
+        }
 
-        Ok(Some(data))
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| Error::ApiRequest {
+            description: format!("Failed to retrieve PGCR {} after {} retries", instance_id, MAX_RETRIES),
+        }))
     }
 }
