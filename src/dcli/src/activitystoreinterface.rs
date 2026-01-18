@@ -752,19 +752,38 @@ impl ActivityStoreInterface {
             }
 
             // Batch insert all fetched activities in a single transaction
+            // Use match instead of ? to prevent early return on batch errors
+            // Failed activities remain in queue for retry on next sync
             if !activities_to_insert.is_empty() {
-                total_synced += self
+                match self
                     .insert_activities_batch(&mut activities_to_insert, character_id)
-                    .await?;
+                    .await
+                {
+                    Ok(count) => total_synced += count,
+                    Err(e) => {
+                        tell::error!(
+                            "Error inserting activity batch for character {}. Continuing with next chunk: {}",
+                            character_id,
+                            e
+                        );
+                        debug_log(&format!(
+                            "BATCH INSERT ERROR: char={} error={} - continuing with next chunk",
+                            character_id, e
+                        ));
+                    }
+                }
             }
         }
 
         pb.finish_and_clear();
 
         if !ids.is_empty() {
-            sqlx::query("PRAGMA OPTIMIZE;")
+            if let Err(e) = sqlx::query("PRAGMA OPTIMIZE;")
                 .execute(&mut self.db)
-                .await?;
+                .await
+            {
+                tell::error!("PRAGMA OPTIMIZE failed: {}", e);
+            }
         }
 
         Ok(SyncResult {
@@ -782,6 +801,8 @@ impl ActivityStoreInterface {
     where
         F: Fn(SyncProgress),
     {
+        debug_log(&format!("sync_activities_with_progress START: character_id={}", character_id));
+
         let mut ids: Vec<i64> = Vec::new();
 
         {
@@ -806,7 +827,10 @@ impl ActivityStoreInterface {
             }
         };
 
+        debug_log(&format!("sync_activities_with_progress: queried {} unsynced IDs for char={}", ids.len(), character_id));
+
         if ids.is_empty() {
+            debug_log(&format!("sync_activities_with_progress END (empty): char={}", character_id));
             return Ok(SyncResult {
                 total_available: 0,
                 total_synced: 0,
@@ -814,16 +838,21 @@ impl ActivityStoreInterface {
         }
 
         let mut filtered_ids = Vec::new();
+        let mut already_synced_count = 0;
 
         for id in ids {
             if self.has_activity(&id).await {
                 self.remove_from_activity_queue(character_id, &id).await?;
+                already_synced_count += 1;
                 continue;
             } else {
                 filtered_ids.push(id)
             }
         }
         ids = filtered_ids;
+
+        debug_log(&format!("sync_activities_with_progress: after filtering, {} to sync (skipped {} already synced) for char={}",
+            ids.len(), already_synced_count, character_id));
 
         let total_available = ids.len() as u32;
         let mut total_synced = 0;
@@ -848,7 +877,12 @@ impl ActivityStoreInterface {
         );
 
         let mut downloaded_count: u32 = 0;
+        let total_chunks = (ids.len() + PGCR_REQUEST_CHUNK_AMOUNT - 1) / PGCR_REQUEST_CHUNK_AMOUNT;
+        let mut chunk_num = 0;
+        debug_log(&format!("sync_activities_with_progress: processing {} chunks for char={}", total_chunks, character_id));
+
         for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
+            chunk_num += 1;
             // Report downloading progress
             on_progress(SyncProgress::DownloadingActivities {
                 current: downloaded_count,
@@ -884,25 +918,47 @@ impl ActivityStoreInterface {
             }
 
             // Report saving progress
+            // Use match instead of ? to prevent early return on batch errors
+            // Failed activities remain in queue for retry on next sync
             if !activities_to_insert.is_empty() {
                 on_progress(SyncProgress::SavingActivities {
                     current: total_synced,
                     total: total_available,
                 });
 
-                total_synced += self
+                match self
                     .insert_activities_batch(&mut activities_to_insert, character_id)
-                    .await?;
+                    .await
+                {
+                    Ok(count) => total_synced += count,
+                    Err(e) => {
+                        tell::error!(
+                            "Error inserting activity batch for character {}. Continuing with next chunk: {}",
+                            character_id,
+                            e
+                        );
+                        debug_log(&format!(
+                            "BATCH INSERT ERROR: char={} error={} - continuing with next chunk",
+                            character_id, e
+                        ));
+                    }
+                }
             }
         }
 
         pb.finish_and_clear();
 
         if !ids.is_empty() {
-            sqlx::query("PRAGMA OPTIMIZE;")
+            if let Err(e) = sqlx::query("PRAGMA OPTIMIZE;")
                 .execute(&mut self.db)
-                .await?;
+                .await
+            {
+                tell::error!("PRAGMA OPTIMIZE failed: {}", e);
+            }
         }
+
+        debug_log(&format!("sync_activities_with_progress END: char={} total_available={} total_synced={}",
+            character_id, total_available, total_synced));
 
         Ok(SyncResult {
             total_available,
