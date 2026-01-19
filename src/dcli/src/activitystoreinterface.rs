@@ -20,23 +20,9 @@
 * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::str::FromStr;
 use std::{collections::HashMap, path::Path};
 use tell::{Tell, TellLevel};
-
-// Debug logging to file for sync investigation
-fn debug_log(message: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/dcli_sync_debug.log")
-    {
-        let timestamp = chrono::Utc::now().format("%H:%M:%S%.3f");
-        let _ = writeln!(file, "[{}] {}", timestamp, message);
-    }
-}
 
 use chrono::{DateTime, Utc};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
@@ -536,10 +522,6 @@ impl ActivityStoreInterface {
         );
         tell::progress!("This may take a few minutes depending on the number of activities.");
 
-        debug_log(&format!(
-            "=== SYNC MEMBER START: {} ===",
-            member.name.get_bungie_name()
-        ));
         for char_info in characters.characters {
             let character_id = &char_info.id;
             self.insert_character(
@@ -553,57 +535,28 @@ impl ActivityStoreInterface {
                 format!("[{}]", char_info.class_type).to_uppercase()
             );
 
-            debug_log(&format!(
-                "--- CHARACTER {} ({}) ---",
-                char_info.class_type, character_id
-            ));
-
             //these calls could be a little more general purpose by taking api ids and not db ids.
             //however, passing the db ids, lets us optimize a lot of the sql, and avoid
             //some extra calls to the DB
 
-            debug_log("Step 1: sync_activities (pre-queue)");
             let sync_result_a = self.sync_activities(character_id).await?;
-            debug_log(&format!(
-                "Step 1 result: synced={}, available={}",
-                sync_result_a.total_synced, sync_result_a.total_available
-            ));
 
-            debug_log("Step 2: update_activity_queue");
-            let queue_result = self
+            let _queue_result = self
                 .update_activity_queue(
                     &member.id,
                     character_id,
                     &member.platform,
                 )
                 .await?;
-            debug_log(&format!(
-                "Step 2 result: synced={}, available={}",
-                queue_result.total_synced, queue_result.total_available
-            ));
 
-            debug_log("Step 3: sync_activities (post-queue)");
             let sync_result_b = self.sync_activities(character_id).await?;
-            debug_log(&format!(
-                "Step 3 result: synced={}, available={}",
-                sync_result_b.total_synced, sync_result_b.total_available
-            ));
 
             total_synced +=
                 sync_result_a.total_synced + sync_result_b.total_synced;
             total_in_queue += (sync_result_a.total_available
                 + sync_result_b.total_available)
                 - (sync_result_a.total_synced + sync_result_b.total_synced);
-
-            debug_log(&format!(
-                "Character {} done: total_synced so far={}",
-                char_info.class_type, total_synced
-            ));
         }
-        debug_log(&format!(
-            "=== SYNC MEMBER END: total_synced={} ===",
-            total_synced
-        ));
 
         self.update_sync_entry(&member.id).await?;
 
@@ -805,10 +758,6 @@ impl ActivityStoreInterface {
                             character_id,
                             e
                         );
-                        debug_log(&format!(
-                            "BATCH INSERT ERROR: char={} error={} - continuing with next chunk",
-                            character_id, e
-                        ));
                     }
                 }
             }
@@ -839,11 +788,6 @@ impl ActivityStoreInterface {
     where
         F: Fn(SyncProgress),
     {
-        debug_log(&format!(
-            "sync_activities_with_progress START: character_id={}",
-            character_id
-        ));
-
         let mut ids: Vec<i64> = Vec::new();
 
         {
@@ -868,13 +812,7 @@ impl ActivityStoreInterface {
             }
         };
 
-        debug_log(&format!("sync_activities_with_progress: queried {} unsynced IDs for char={}", ids.len(), character_id));
-
         if ids.is_empty() {
-            debug_log(&format!(
-                "sync_activities_with_progress END (empty): char={}",
-                character_id
-            ));
             return Ok(SyncResult {
                 total_available: 0,
                 total_synced: 0,
@@ -882,21 +820,16 @@ impl ActivityStoreInterface {
         }
 
         let mut filtered_ids = Vec::new();
-        let mut already_synced_count = 0;
 
         for id in ids {
             if self.has_activity(&id).await {
                 self.remove_from_activity_queue(character_id, &id).await?;
-                already_synced_count += 1;
                 continue;
             } else {
                 filtered_ids.push(id)
             }
         }
         ids = filtered_ids;
-
-        debug_log(&format!("sync_activities_with_progress: after filtering, {} to sync (skipped {} already synced) for char={}",
-            ids.len(), already_synced_count, character_id));
 
         let total_available = ids.len() as u32;
         let mut total_synced = 0;
@@ -921,16 +854,8 @@ impl ActivityStoreInterface {
         );
 
         let mut downloaded_count: u32 = 0;
-        let total_chunks = (ids.len() + PGCR_REQUEST_CHUNK_AMOUNT - 1)
-            / PGCR_REQUEST_CHUNK_AMOUNT;
-        let mut _chunk_num = 0;
-        debug_log(&format!(
-            "sync_activities_with_progress: processing {} chunks for char={}",
-            total_chunks, character_id
-        ));
 
         for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
-            _chunk_num += 1;
             // Report downloading progress
             on_progress(SyncProgress::DownloadingActivities {
                 current: downloaded_count,
@@ -991,10 +916,6 @@ impl ActivityStoreInterface {
                             character_id,
                             e
                         );
-                        debug_log(&format!(
-                            "BATCH INSERT ERROR: char={} error={} - continuing with next chunk",
-                            character_id, e
-                        ));
                     }
                 }
             }
@@ -1009,9 +930,6 @@ impl ActivityStoreInterface {
                 tell::error!("PRAGMA OPTIMIZE failed: {}", e);
             }
         }
-
-        debug_log(&format!("sync_activities_with_progress END: char={} total_available={} total_synced={}",
-            character_id, total_available, total_synced));
 
         Ok(SyncResult {
             total_available,
@@ -1075,12 +993,7 @@ impl ActivityStoreInterface {
         platform: &Platform,
         mode: &Mode,
     ) -> Result<SyncResult, Error> {
-        debug_log(&format!(
-            "_update_activity_queue: mode={:?} character_id={}",
-            mode, character_id
-        ));
         let max_id: i64 = self.get_max_activity_id(character_id, mode).await?;
-        debug_log(&format!("  -> max_id returned: {}", max_id));
         tell::update!(
             "DEBUG: _update_activity_queue mode={:?} max_id={} character_id={}",
             mode,
@@ -1100,7 +1013,6 @@ impl ActivityStoreInterface {
             .await?;
 
         if result.is_none() {
-            debug_log(&format!("  -> API returned None for mode={:?}", mode));
             tell::update!("DEBUG: No activities found for mode={:?}", mode);
             return Ok(SyncResult {
                 total_available: 0,
@@ -1109,11 +1021,6 @@ impl ActivityStoreInterface {
         }
 
         let mut activities = result.unwrap();
-        debug_log(&format!(
-            "  -> API returned {} activities for mode={:?}",
-            activities.len(),
-            mode
-        ));
         tell::update!(
             "DEBUG: Found {} activities for mode={:?}",
             activities.len(),
@@ -1201,10 +1108,6 @@ impl ActivityStoreInterface {
         .unwrap_or(0);
 
         let actually_inserted = queue_after - queue_before;
-        debug_log(&format!(
-            "  -> Queue insert: before={} after={} inserted={} (tried {})",
-            queue_before, queue_after, actually_inserted, total
-        ));
         tell::update!("DEBUG: Queue insert complete. Before={} After={} Actually inserted={} (tried to insert {})",
             queue_before, queue_after, actually_inserted, total);
 
@@ -1554,16 +1457,6 @@ impl ActivityStoreInterface {
                 .any(|m| m.is_crucible());
 
             if is_pvp_activity {
-                debug_log(&format!(
-                    "FIX: Adding AllPvP to activity {} (modes: {:?})",
-                    activity.activity_details.instance_id,
-                    activity
-                        .activity_details
-                        .modes
-                        .iter()
-                        .map(|m| m.as_id())
-                        .collect::<Vec<_>>()
-                ));
                 self.add_to_modes(activity, Mode::AllPvP);
                 was_updated = true;
             }
@@ -1576,16 +1469,6 @@ impl ActivityStoreInterface {
             .iter()
             .any(|m| *m == Mode::PrivateMatchesAll);
         if !has_private_all && is_private {
-            debug_log(&format!(
-                "FIX: Adding PrivateMatchesAll to activity {} (modes: {:?})",
-                activity.activity_details.instance_id,
-                activity
-                    .activity_details
-                    .modes
-                    .iter()
-                    .map(|m| m.as_id())
-                    .collect::<Vec<_>>()
-            ));
             self.add_to_modes(activity, Mode::PrivateMatchesAll);
             was_updated = true;
         }
@@ -2072,8 +1955,6 @@ impl ActivityStoreInterface {
         .await
         .unwrap_or(0);
 
-        debug_log(&format!("get_max_activity_id: char={} mode={:?}({}) queue={} synced={} with_mode={}",
-            character_id, mode, mode.as_id(), queue_count, synced_count, mode_count));
         tell::update!("DEBUG: get_max_activity_id char={} mode={:?}({}) queue_total={} synced={} with_mode={}",
             character_id, mode, mode.as_id(), queue_count, synced_count, mode_count);
 
@@ -2101,7 +1982,6 @@ impl ActivityStoreInterface {
         .await?;
 
         if rows.is_empty() {
-            debug_log("  -> returning 0 (no matching rows)");
             tell::update!(
                 "DEBUG: get_max_activity_id returning 0 (no matching rows)"
             );
@@ -2110,7 +1990,6 @@ impl ActivityStoreInterface {
 
         let row = &rows[0];
         let activity_id: i64 = row.try_get("max_activity_id")?;
-        debug_log(&format!("  -> returning {}", activity_id));
 
         tell::update!("DEBUG: get_max_activity_id returning {}", activity_id);
 
