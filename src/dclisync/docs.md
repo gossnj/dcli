@@ -39,7 +39,7 @@ dclisync is the data ingestion layer for dcli. It uses @/dcli/src/dcli `Activity
 
 **Initial Sync Duration**: First sync of a player with extensive history can take several minutes. Subsequent syncs are fast since only new activities are fetched.
 
-**Concurrent Requests**: Uses chunked concurrent requests (50 at a time) to Bungie API for PGCR data. Balance between speed and API rate limiting.
+**Concurrent Requests**: Uses chunked concurrent requests (25 at a time) to Bungie API for PGCR data. Balance between speed and API rate limiting.
 
 **Database Location**: Default is system data directory (e.g., `~/Library/Application Support/dcli` on macOS). Can be overridden with command-line option. Both dclisync and querying tools must point to same database path.
 

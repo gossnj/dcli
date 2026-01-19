@@ -59,7 +59,7 @@ store.sync_player(&player_name).await?;
 
 **Incremental Syncing**: ActivityStoreInterface tracks last sync time per player. Only fetches activities since last sync, making subsequent syncs fast.
 
-**Concurrent PGCR Fetching**: ActivityStoreInterface fetches PGCRs in chunks (50 concurrent requests) to balance speed vs API rate limits.
+**Concurrent PGCR Fetching**: ActivityStoreInterface fetches PGCRs in chunks (25 concurrent requests) to balance speed vs API rate limits.
 
 **Database Transactions**: All database writes wrapped in transactions for consistency. Interrupted syncs leave database in valid state.
 
