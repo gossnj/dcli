@@ -31,7 +31,6 @@ use chrono::{DateTime, Utc};
 use indicatif::{HumanCount, ProgressBar, ProgressStyle};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use crate::response::{gpr::{CharacterActivitiesData, GetProfileResponse}, cr::GetCharacterResponse};
 use crate::response::pgcr::{DestinyPostGameCarnageReportData, PGCRResponse};
 use crate::response::sdpr::{
     DestinyLinkedProfilesResponse, LinkedProfilesResponse,
@@ -46,6 +45,10 @@ use crate::response::{
     sdpr::SearchDestinyPlayerPostData,
 };
 use crate::response::{character::CharacterData, gmd::GetMembershipData};
+use crate::response::{
+    cr::GetCharacterResponse,
+    gpr::{CharacterActivitiesData, GetProfileResponse},
+};
 use crate::response::{
     ggms::{GetGroupMemberResponse, GroupMemberResponse},
     gmd::UserMembershipData,
@@ -348,26 +351,23 @@ impl ApiInterface {
 
     pub async fn retrieve_character(
         &self,
-        member:&Member,
+        member: &Member,
         character_id: &i64,
     ) -> Result<Option<CharacterData>, Error> {
-
         let url = format!(
             "{base}/Platform/Destiny2/{platform_id}/Profile/{member_id}/Character/{character_id}/?components=200",
 
-            
+
             base = API_BASE_URL,
             platform_id = member.platform.as_id(),
             member_id = member.id,
             character_id = character_id
         );
 
-        
-
         let profile: GetCharacterResponse = self
-        .client
-        .call_and_parse::<GetCharacterResponse>(&url)
-        .await?;
+            .client
+            .call_and_parse::<GetCharacterResponse>(&url)
+            .await?;
 
         let response = match profile.response {
             Some(e) => e,
@@ -380,10 +380,8 @@ impl ApiInterface {
             }
         };
 
-        
-
         if response.character.is_none() {
-            return Ok(None)
+            return Ok(None);
         }
 
         Ok(response.character.unwrap().data)
@@ -695,7 +693,10 @@ impl ApiInterface {
         pb.set_message("Searching for new activities.");
 
         //TODO: if error occurs on an individual call, retry?
-        tell::update!("DEBUG: Starting activity fetch, looking for activity_id={}", activity_id);
+        tell::update!(
+            "DEBUG: Starting activity fetch, looking for activity_id={}",
+            activity_id
+        );
         loop {
             //tell::progress!(".");
             io::stderr().flush().unwrap();
@@ -721,7 +722,11 @@ impl ApiInterface {
             pb.inc(1);
 
             if activities.is_none() {
-                tell::update!("DEBUG: Page {} returned None, breaking. Total so far: {}", page, out.len());
+                tell::update!(
+                    "DEBUG: Page {} returned None, breaking. Total so far: {}",
+                    page,
+                    out.len()
+                );
                 break;
             }
 
@@ -858,15 +863,20 @@ impl ApiInterface {
             if attempt > 0 {
                 // Exponential backoff: 100ms, 200ms, 400ms
                 let delay = BASE_DELAY_MS * (1 << attempt);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay))
+                    .await;
             }
 
             match self.client.call_and_parse::<PGCRResponse>(&url).await {
                 Ok(response) => {
-                    let data: DestinyPostGameCarnageReportData = match response.response {
+                    let data: DestinyPostGameCarnageReportData = match response
+                        .response
+                    {
                         Some(e) => e,
                         None => {
-                            if response.status.error_code == API_RESPONSE_STATUS_SUCCESS {
+                            if response.status.error_code
+                                == API_RESPONSE_STATUS_SUCCESS
+                            {
                                 return Ok(None);
                             } else {
                                 // API returned error status - retry
@@ -892,7 +902,10 @@ impl ApiInterface {
 
         // All retries exhausted
         Err(last_error.unwrap_or_else(|| Error::ApiRequest {
-            description: format!("Failed to retrieve PGCR {} after {} retries", instance_id, MAX_RETRIES),
+            description: format!(
+                "Failed to retrieve PGCR {} after {} retries",
+                instance_id, MAX_RETRIES
+            ),
         }))
     }
 }

@@ -22,11 +22,11 @@
 
 mod datetimeformat;
 
+use clap::Parser;
 use datetimeformat::DateTimeFormat;
 use dcli::enums::moment::Moment;
 use dcli::output::Output;
 use dcli::utils::build_tsv;
-use clap::Parser;
 use tell::{Tell, TellLevel};
 
 #[derive(Parser, Debug)]

@@ -5,19 +5,18 @@
  * for use from Kotlin/Java on Android.
  */
 
+use jni::objects::{JClass, JFloatArray, JIntArray, JLongArray, JString};
+use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::JNIEnv;
-use jni::objects::{JClass, JString, JLongArray, JIntArray, JFloatArray};
-use jni::sys::{jlong, jint, jboolean, jfloat};
 use std::ffi::CString;
 
 use crate::{
-    DcliApiClient, DcliActivityStore, DcliCrucibleStats, DcliCharacter,
-    dcli_client_new, dcli_client_free, dcli_search_player,
-    dcli_get_characters, dcli_get_crucible_stats,
-    dcli_store_init, dcli_store_free, dcli_store_add_player,
-    dcli_store_remove_player, dcli_store_sync_player,
-    dcli_store_get_crucible_stats,
-    dcli_manifest_needs_update, dcli_manifest_download,
+    dcli_client_free, dcli_client_new, dcli_get_characters,
+    dcli_get_crucible_stats, dcli_manifest_download,
+    dcli_manifest_needs_update, dcli_search_player, dcli_store_add_player,
+    dcli_store_free, dcli_store_get_crucible_stats, dcli_store_init,
+    dcli_store_remove_player, dcli_store_sync_player, DcliActivityStore,
+    DcliApiClient, DcliCharacter, DcliCrucibleStats,
 };
 
 /// Helper to convert JString to CString, returning None on failure
@@ -47,7 +46,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     let c_api_key = match jstring_to_cstring(&mut env, &api_key) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert API key string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert API key string",
+            );
             return 0;
         }
     };
@@ -96,7 +98,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     let c_bungie_name = match jstring_to_cstring(&mut env, &bungie_name) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert bungie name string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert bungie name string",
+            );
             return 0;
         }
     };
@@ -117,8 +122,12 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
 
     // Write platform to output array
     let platform_array = [platform];
-    if let Err(e) = env.set_int_array_region(&out_platform, 0, &platform_array) {
-        throw_runtime_exception(&mut env, &format!("Failed to set platform: {:?}", e));
+    if let Err(e) = env.set_int_array_region(&out_platform, 0, &platform_array)
+    {
+        throw_runtime_exception(
+            &mut env,
+            &format!("Failed to set platform: {:?}", e),
+        );
         return 0;
     }
 
@@ -149,9 +158,21 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
 
     // Allocate space for up to 3 characters
     let mut characters = [
-        DcliCharacter { id: 0, class_type: 0, minutes_played_total: 0 },
-        DcliCharacter { id: 0, class_type: 0, minutes_played_total: 0 },
-        DcliCharacter { id: 0, class_type: 0, minutes_played_total: 0 },
+        DcliCharacter {
+            id: 0,
+            class_type: 0,
+            minutes_played_total: 0,
+        },
+        DcliCharacter {
+            id: 0,
+            class_type: 0,
+            minutes_played_total: 0,
+        },
+        DcliCharacter {
+            id: 0,
+            class_type: 0,
+            minutes_played_total: 0,
+        },
     ];
 
     let count = dcli_get_characters(
@@ -167,20 +188,43 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     }
 
     // Fill output arrays
-    let ids: Vec<i64> = characters.iter().take(count as usize).map(|c| c.id).collect();
-    let class_types: Vec<i32> = characters.iter().take(count as usize).map(|c| c.class_type).collect();
-    let minutes: Vec<i64> = characters.iter().take(count as usize).map(|c| c.minutes_played_total).collect();
+    let ids: Vec<i64> = characters
+        .iter()
+        .take(count as usize)
+        .map(|c| c.id)
+        .collect();
+    let class_types: Vec<i32> = characters
+        .iter()
+        .take(count as usize)
+        .map(|c| c.class_type)
+        .collect();
+    let minutes: Vec<i64> = characters
+        .iter()
+        .take(count as usize)
+        .map(|c| c.minutes_played_total)
+        .collect();
 
     if let Err(e) = env.set_long_array_region(&out_ids, 0, &ids) {
-        throw_runtime_exception(&mut env, &format!("Failed to set ids: {:?}", e));
+        throw_runtime_exception(
+            &mut env,
+            &format!("Failed to set ids: {:?}", e),
+        );
         return 0;
     }
-    if let Err(e) = env.set_int_array_region(&out_class_types, 0, &class_types) {
-        throw_runtime_exception(&mut env, &format!("Failed to set class types: {:?}", e));
+    if let Err(e) = env.set_int_array_region(&out_class_types, 0, &class_types)
+    {
+        throw_runtime_exception(
+            &mut env,
+            &format!("Failed to set class types: {:?}", e),
+        );
         return 0;
     }
-    if let Err(e) = env.set_long_array_region(&out_minutes_played, 0, &minutes) {
-        throw_runtime_exception(&mut env, &format!("Failed to set minutes: {:?}", e));
+    if let Err(e) = env.set_long_array_region(&out_minutes_played, 0, &minutes)
+    {
+        throw_runtime_exception(
+            &mut env,
+            &format!("Failed to set minutes: {:?}", e),
+        );
         return 0;
     }
 
@@ -260,7 +304,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     ];
 
     if let Err(e) = env.set_float_array_region(&out_stats, 0, &stats_array) {
-        throw_runtime_exception(&mut env, &format!("Failed to set stats: {:?}", e));
+        throw_runtime_exception(
+            &mut env,
+            &format!("Failed to set stats: {:?}", e),
+        );
         return 0;
     }
 
@@ -282,7 +329,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_data_dir = match jstring_to_cstring(&mut env, &data_dir) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert data dir string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert data dir string",
+            );
             return 0;
         }
     };
@@ -325,12 +375,18 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_bungie_name = match jstring_to_cstring(&mut env, &bungie_name) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert bungie name string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert bungie name string",
+            );
             return 0;
         }
     };
 
-    if dcli_store_add_player(ptr as *mut DcliActivityStore, c_bungie_name.as_ptr()) {
+    if dcli_store_add_player(
+        ptr as *mut DcliActivityStore,
+        c_bungie_name.as_ptr(),
+    ) {
         1
     } else {
         0
@@ -354,12 +410,18 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_bungie_name = match jstring_to_cstring(&mut env, &bungie_name) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert bungie name string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert bungie name string",
+            );
             return 0;
         }
     };
 
-    if dcli_store_remove_player(ptr as *mut DcliActivityStore, c_bungie_name.as_ptr()) {
+    if dcli_store_remove_player(
+        ptr as *mut DcliActivityStore,
+        c_bungie_name.as_ptr(),
+    ) {
         1
     } else {
         0
@@ -383,12 +445,18 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_bungie_name = match jstring_to_cstring(&mut env, &bungie_name) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert bungie name string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert bungie name string",
+            );
             return 0;
         }
     };
 
-    if dcli_store_sync_player(ptr as *mut DcliActivityStore, c_bungie_name.as_ptr()) {
+    if dcli_store_sync_player(
+        ptr as *mut DcliActivityStore,
+        c_bungie_name.as_ptr(),
+    ) {
         1
     } else {
         0
@@ -415,7 +483,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_bungie_name = match jstring_to_cstring(&mut env, &bungie_name) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert bungie name string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert bungie name string",
+            );
             return 0;
         }
     };
@@ -470,7 +541,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     ];
 
     if let Err(e) = env.set_float_array_region(&out_stats, 0, &stats_array) {
-        throw_runtime_exception(&mut env, &format!("Failed to set stats: {:?}", e));
+        throw_runtime_exception(
+            &mut env,
+            &format!("Failed to set stats: {:?}", e),
+        );
         return 0;
     }
 
@@ -493,20 +567,28 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_data_dir = match jstring_to_cstring(&mut env, &data_dir) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert data dir string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert data dir string",
+            );
             return -1;
         }
     };
 
     let mut needs_update: bool = false;
 
-    let success = dcli_manifest_needs_update(c_data_dir.as_ptr(), &mut needs_update);
+    let success =
+        dcli_manifest_needs_update(c_data_dir.as_ptr(), &mut needs_update);
 
     if !success {
         return -1;
     }
 
-    if needs_update { 1 } else { 0 }
+    if needs_update {
+        1
+    } else {
+        0
+    }
 }
 
 /// Downloads and installs the manifest
@@ -521,7 +603,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_data_dir = match jstring_to_cstring(&mut env, &data_dir) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert data dir string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert data dir string",
+            );
             return 0;
         }
     };
@@ -529,7 +614,10 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     let c_api_key = match jstring_to_cstring(&mut env, &api_key) {
         Some(s) => s,
         None => {
-            throw_runtime_exception(&mut env, "Failed to convert API key string");
+            throw_runtime_exception(
+                &mut env,
+                "Failed to convert API key string",
+            );
             return 0;
         }
     };

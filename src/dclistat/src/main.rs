@@ -38,8 +38,8 @@ use dcli::enums::character::CharacterClassSelection;
 
 use dcli::activitystoreinterface::ActivityStoreInterface;
 
-use dcli::utils::EXIT_FAILURE;
 use clap::Parser;
+use dcli::utils::EXIT_FAILURE;
 
 #[allow(clippy::too_many_arguments)]
 fn print_default(data: &PlayerActivitiesSummary, stats: &[Stat]) {

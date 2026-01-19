@@ -25,6 +25,7 @@ mod manifest_info;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use clap::Parser;
 use dcli::apiclient::ApiClient;
 use dcli::error::Error;
 use dcli::manifestinterface::MANIFEST_FILE_NAME;
@@ -33,7 +34,6 @@ use dcli::response::manifest::ManifestResponse;
 use dcli::utils::{build_tsv, determine_data_dir};
 use dcli::utils::{format_error, EXIT_FAILURE};
 use manifest_info::ManifestInfo;
-use clap::Parser;
 use tell::{Tell, TellLevel};
 use tokio::io::AsyncWriteExt;
 

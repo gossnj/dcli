@@ -496,7 +496,7 @@ impl AggregateCruciblePerformances {
                 for w in &e.weapons {
                     let key = &w.weapon.id;
 
-                    let mut ws = match weapon_hash.get_mut(key) {
+                    let ws = match weapon_hash.get_mut(key) {
                         Some(e) => {
                             e.activity_count += 1;
                             e.kills += w.kills;

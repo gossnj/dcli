@@ -55,9 +55,9 @@ use dcli::utils::{
     uppercase_first_char,
 };
 
+use clap::Parser;
 use dcli::utils::EXIT_FAILURE;
 use num_format::{Locale, ToFormattedString};
-use clap::Parser;
 
 #[allow(clippy::too_many_arguments)]
 fn print_default(

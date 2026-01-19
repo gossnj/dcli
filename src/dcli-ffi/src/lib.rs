@@ -24,7 +24,7 @@
 #[cfg(target_os = "android")]
 mod android;
 
-use log::{info, error, debug};
+use log::{debug, error, info};
 
 #[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 use log::LevelFilter;
@@ -46,9 +46,9 @@ fn init_platform_logging() {
     INIT.call_once(|| {
         OsLogger::new("com.ottercreeksoftware.Last-Banner.dcli")
             .level_filter(LevelFilter::Debug)
-            .category_level_filter("sqlx", LevelFilter::Warn)  // Silence sqlx query spam
+            .category_level_filter("sqlx", LevelFilter::Warn) // Silence sqlx query spam
             .init()
-            .ok();  // Ignore errors if already initialized
+            .ok(); // Ignore errors if already initialized
     });
 }
 
@@ -64,31 +64,37 @@ fn init_platform_logging() {
         Config::default()
             .with_max_level(LevelFilter::Debug)
             .with_tag("dcli_ffi")
-            .with_filter(FilterBuilder::new()
-                .filter(Some("sqlx"), LevelFilter::Warn)  // Silence sqlx query spam
-                .filter(Some("dcli_ffi"), LevelFilter::Debug)
-                .build())
+            .with_filter(
+                FilterBuilder::new()
+                    .filter(Some("sqlx"), LevelFilter::Warn) // Silence sqlx query spam
+                    .filter(Some("dcli_ffi"), LevelFilter::Debug)
+                    .build(),
+            ),
     );
 }
 
 // Other platforms - no-op
-#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "android"
+)))]
 fn init_platform_logging() {
     // No-op on other platforms
 }
 
+use chrono::{Duration, Utc};
+use dcli::activitystoreinterface::{ActivityStoreInterface, SyncProgress};
+use dcli::apiinterface::ApiInterface;
+use dcli::crucible::PlayerName;
+use dcli::enums::character::CharacterClassSelection;
+use dcli::enums::mode::Mode;
+use dcli::enums::moment::DateTimePeriod;
+use dcli::enums::platform::Platform;
+use dcli::manifestinterface::ManifestInterface;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
-use dcli::apiinterface::ApiInterface;
-use dcli::enums::platform::Platform;
-use dcli::enums::mode::Mode;
-use dcli::crucible::PlayerName;
-use dcli::activitystoreinterface::{ActivityStoreInterface, SyncProgress};
-use dcli::manifestinterface::ManifestInterface;
-use dcli::enums::character::CharacterClassSelection;
-use dcli::enums::moment::DateTimePeriod;
-use chrono::{Utc, Duration};
 
 /// Opaque pointer to ApiInterface
 pub struct DcliApiClient {
@@ -128,7 +134,9 @@ pub struct DcliCharacter {
 /// Returns null on error
 /// Caller must call dcli_client_free when done
 #[no_mangle]
-pub extern "C" fn dcli_client_new(api_key: *const c_char) -> *mut DcliApiClient {
+pub extern "C" fn dcli_client_new(
+    api_key: *const c_char,
+) -> *mut DcliApiClient {
     init_platform_logging();
 
     if api_key.is_null() {
@@ -175,7 +183,11 @@ pub extern "C" fn dcli_search_player(
     out_member_id: *mut i64,
     out_platform: *mut i32,
 ) -> bool {
-    if client.is_null() || bungie_name.is_null() || out_member_id.is_null() || out_platform.is_null() {
+    if client.is_null()
+        || bungie_name.is_null()
+        || out_member_id.is_null()
+        || out_platform.is_null()
+    {
         return false;
     }
 
@@ -237,12 +249,15 @@ pub extern "C" fn dcli_get_crucible_stats(
     };
 
     let result = client.runtime.block_on(async {
-        client.client.retrieve_alltime_crucible_stats(
-            &member_id,
-            &character_id,
-            &platform,
-            &mode,
-        ).await
+        client
+            .client
+            .retrieve_alltime_crucible_stats(
+                &member_id,
+                &character_id,
+                &platform,
+                &mode,
+            )
+            .await
     });
 
     match result {
@@ -293,7 +308,10 @@ pub extern "C" fn dcli_get_characters(
     let platform = Platform::from_id(platform as u32);
 
     let result = client.runtime.block_on(async {
-        client.client.retrieve_characters(&member_id, &platform).await
+        client
+            .client
+            .retrieve_characters(&member_id, &platform)
+            .await
     });
 
     match result {
@@ -330,7 +348,8 @@ pub struct DcliActivityStore {
 
 /// Progress callback type for sync operations
 /// Parameters: message (const char*), current (u32), total (u32), user_data (void*)
-pub type ProgressCallback = extern "C" fn(*const c_char, u32, u32, *mut std::ffi::c_void);
+pub type ProgressCallback =
+    extern "C" fn(*const c_char, u32, u32, *mut std::ffi::c_void);
 
 /// Creates a new activity store with the given data directory
 /// Returns null on error
@@ -369,13 +388,11 @@ pub extern "C" fn dcli_store_init(
     });
 
     match result {
-        Some((store, manifest)) => {
-            Box::into_raw(Box::new(DcliActivityStore {
-                store,
-                manifest,
-                runtime,
-            }))
-        }
+        Some((store, manifest)) => Box::into_raw(Box::new(DcliActivityStore {
+            store,
+            manifest,
+            runtime,
+        })),
         None => std::ptr::null_mut(),
     }
 }
@@ -475,7 +492,12 @@ pub extern "C" fn dcli_store_sync_player(
     store: *mut DcliActivityStore,
     bungie_name: *const c_char,
 ) -> bool {
-    dcli_store_sync_player_with_progress(store, bungie_name, None, std::ptr::null_mut())
+    dcli_store_sync_player_with_progress(
+        store,
+        bungie_name,
+        None,
+        std::ptr::null_mut(),
+    )
 }
 
 /// Syncs a player's activities from the API by Bungie name with progress callback
@@ -527,7 +549,9 @@ pub extern "C" fn dcli_store_sync_player_with_progress(
                 SyncProgress::Complete { total_synced } => {
                     format!("Sync complete! {} activities synced", total_synced)
                 }
-                SyncProgress::Failed { message } => format!("Sync failed: {}", message),
+                SyncProgress::Failed { message } => {
+                    format!("Sync failed: {}", message)
+                }
             };
 
             let (_, current, total) = progress.to_progress_tuple();
@@ -573,7 +597,7 @@ pub extern "C" fn dcli_store_sync_player_with_progress(
 pub extern "C" fn dcli_store_get_crucible_stats(
     store: *mut DcliActivityStore,
     bungie_name: *const c_char,
-    character_class: i32,  // 0=Titan, 1=Hunter, 2=Warlock, 4=All
+    character_class: i32, // 0=Titan, 1=Hunter, 2=Warlock, 4=All
     mode: i32,
     out_stats: *mut DcliCrucibleStats,
 ) -> bool {
@@ -613,7 +637,8 @@ pub extern "C" fn dcli_store_get_crucible_stats(
 
         runtime.block_on(async {
             // First find the member in the database
-            let member = match store_ref.find_member(&player_name, false).await {
+            let member = match store_ref.find_member(&player_name, false).await
+            {
                 Ok(m) => m,
                 Err(_) => return None,
             };
@@ -628,12 +653,15 @@ pub extern "C" fn dcli_store_get_crucible_stats(
             };
 
             // Query the database for activity summary
-            let summary = match store_ref.retrieve_activities_summary(
-                &member,
-                &character_selection,
-                &mode,
-                &time_period,
-            ).await {
+            let summary = match store_ref
+                .retrieve_activities_summary(
+                    &member,
+                    &character_selection,
+                    &mode,
+                    &time_period,
+                )
+                .await
+            {
                 Ok(Some(s)) => s,
                 _ => return None,
             };
@@ -647,11 +675,7 @@ pub extern "C" fn dcli_store_get_crucible_stats(
             let deaths = summary.deaths as f32;
             let assists = summary.assists as f32;
 
-            let kd_ratio = if deaths > 0.0 {
-                kills / deaths
-            } else {
-                kills
-            };
+            let kd_ratio = if deaths > 0.0 { kills / deaths } else { kills };
 
             let efficiency = if deaths > 0.0 {
                 (kills + assists) / deaths
@@ -667,11 +691,12 @@ pub extern "C" fn dcli_store_get_crucible_stats(
 
             // Calculate average kill distance - not available in summary, so we estimate
             let avg_kill_distance = 0.0;
-            let avg_lifespan = if deaths > 0.0 && summary.time_played_seconds > 0 {
-                (summary.time_played_seconds as f32) / deaths
-            } else {
-                0.0
-            };
+            let avg_lifespan =
+                if deaths > 0.0 && summary.time_played_seconds > 0 {
+                    (summary.time_played_seconds as f32) / deaths
+                } else {
+                    0.0
+                };
 
             Some(DcliCrucibleStats {
                 activities_entered: total_activities,
@@ -750,10 +775,11 @@ pub extern "C" fn dcli_manifest_needs_update(
         };
 
         let url = "https://www.bungie.net/Platform/Destiny2/Manifest/";
-        let response = match client.call_and_parse::<ManifestResponse>(url).await {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
+        let response =
+            match client.call_and_parse::<ManifestResponse>(url).await {
+                Ok(r) => r,
+                Err(_) => return None,
+            };
 
         let manifest = match &response.response {
             Some(e) => e,
@@ -855,7 +881,10 @@ pub extern "C" fn dcli_manifest_download(
 
         debug!("Fetching manifest info from Bungie API...");
         let manifest_url = "https://www.bungie.net/Platform/Destiny2/Manifest/";
-        let response = match client.call_and_parse::<ManifestResponse>(manifest_url).await {
+        let response = match client
+            .call_and_parse::<ManifestResponse>(manifest_url)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to fetch manifest info: {:?}", e);
@@ -871,18 +900,28 @@ pub extern "C" fn dcli_manifest_download(
             }
         };
 
-        let download_url = if manifest.mobile_world_content_paths.en.starts_with("http") {
-            manifest.mobile_world_content_paths.en.clone()
-        } else {
-            format!("https://www.bungie.net{}", manifest.mobile_world_content_paths.en)
-        };
+        let download_url =
+            if manifest.mobile_world_content_paths.en.starts_with("http") {
+                manifest.mobile_world_content_paths.en.clone()
+            } else {
+                format!(
+                    "https://www.bungie.net{}",
+                    manifest.mobile_world_content_paths.en
+                )
+            };
         let version = &manifest.version;
-        info!("Downloading manifest version {} from {} (timeout: {}s)", version, download_url, MANIFEST_DOWNLOAD_TIMEOUT_SECS);
+        info!(
+            "Downloading manifest version {} from {} (timeout: {}s)",
+            version, download_url, MANIFEST_DOWNLOAD_TIMEOUT_SECS
+        );
 
         // Create a separate client with longer timeout for the large manifest download
         let download_client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(MANIFEST_DOWNLOAD_TIMEOUT_SECS))
-            .build() {
+            .timeout(std::time::Duration::from_secs(
+                MANIFEST_DOWNLOAD_TIMEOUT_SECS,
+            ))
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create download client: {:?}", e);
@@ -891,13 +930,14 @@ pub extern "C" fn dcli_manifest_download(
         };
 
         // Download the manifest zip file
-        let mut download_response = match download_client.get(&download_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to download manifest: {:?}", e);
-                return false;
-            }
-        };
+        let mut download_response =
+            match download_client.get(&download_url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Failed to download manifest: {:?}", e);
+                    return false;
+                }
+            };
 
         debug!("Reading manifest chunks...");
         let mut out: Vec<u8> = Vec::new();
@@ -949,8 +989,7 @@ pub extern "C" fn dcli_manifest_download(
         // Save manifest info
         let info_json = format!(
             r#"{{"version":"{}","url":"{}"}}"#,
-            version,
-            manifest.mobile_world_content_paths.en
+            version, manifest.mobile_world_content_paths.en
         );
 
         let info_path = dir.join("manifest_info.json");

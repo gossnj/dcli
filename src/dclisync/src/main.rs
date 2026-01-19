@@ -28,11 +28,11 @@ use std::thread;
 use std::time::Duration;
 use tell::{Tell, TellLevel};
 
+use clap::Parser;
 use dcli::activitystoreinterface::ActivityStoreInterface;
 use dcli::apiinterface::ApiInterface;
 use dcli::crucible::{Member, PlayerName};
 use dcli::utils::{determine_data_dir, format_error, EXIT_FAILURE};
-use clap::Parser;
 
 const DEFAULT_REFRESH_INTERVAL: u32 = 60;
 const SHOULD_CONTINUE_CODE: i32 = -1;

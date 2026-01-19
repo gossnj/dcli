@@ -50,8 +50,8 @@ use dcli::utils::{
     repeat_str,
 };
 
-use dcli::utils::EXIT_FAILURE;
 use clap::Parser;
+use dcli::utils::EXIT_FAILURE;
 
 const ELO_SCALE: f32 = 10.0;
 

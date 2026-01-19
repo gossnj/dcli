@@ -31,13 +31,13 @@ use dcli::manifest::definitions::{
     ActivityDefinitionData, DestinationDefinitionData, PlaceDefinitionData,
 };
 //use dcli::error::Error;
+use clap::Parser;
 use dcli::enums::mode::Mode;
 use dcli::manifestinterface::ManifestInterface;
 use dcli::output::Output;
 use dcli::response::gpr::CharacterActivitiesData;
 use dcli::utils::{build_tsv, determine_data_dir};
 use dcli::utils::{format_error, EXIT_FAILURE};
-use clap::Parser;
 
 const ORBIT_PLACE_HASH: u32 = 2961497387;
 
