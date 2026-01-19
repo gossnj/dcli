@@ -274,6 +274,9 @@ impl DestinyProfileUserInfoCard {
 pub struct DestinyPostGameCarnageReportExtendedData {
     pub values: HashMap<String, DestinyHistoricalStatsValue>,
     pub weapons: Option<Vec<DestinyHistoricalWeaponStats>>,
+
+    #[serde(rename = "scoreboardValues")]
+    pub scoreboard_values: Option<HashMap<String, DestinyHistoricalStatsValue>>,
 }
 
 use std::collections::HashMap;

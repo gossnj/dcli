@@ -23,7 +23,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub enum DateTimeFormat {
     RFC2822,
     RFC3339,

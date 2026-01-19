@@ -32,7 +32,8 @@ use crate::utils::{
     format_error, CHECKMATE_CLASH_ACTIVITY_HASH,
     CHECKMATE_CONTROL_ACTIVITY_HASHES, CHECKMATE_COUNTDOWN_ACTIVITY_HASH,
     CHECKMATE_RUMBLE_ACTIVITY_HASH, CHECKMATE_SURVIVAL_ACTIVITY_HASH,
-    COMPETITIVE_PVP_ACTIVITY_HASH, FREELANCE_COMPETITIVE_PVP_ACTIVITY_HASH,
+    COMPETITIVE_PVP_ACTIVITY_HASH, COMPETITIVE_PVP_ACTIVITY_HASH_S25,
+    FREELANCE_COMPETITIVE_PVP_ACTIVITY_HASH,
     IRON_BANNER_FORTRESS_ACTIVITY_HASH, IRON_BANNER_TRIBUTE_ACTIVITY_HASH,
 };
 use crate::{
@@ -48,7 +49,7 @@ use crate::{
 use futures::TryStreamExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::Row;
-use sqlx::{ConnectOptions, SqliteConnection};
+use sqlx::{ConnectOptions, QueryBuilder, Sqlite, SqliteConnection};
 
 use crate::crucible::{
     ActivityDetail, CruciblePlayerActivityPerformance,
@@ -81,7 +82,8 @@ const STORE_DB_SCHEMA: &str = include_str!("../actitvity_store_schema.sql");
 const DCLI_FIX_DATA: &str = "DCLI_FIX_DATA";
 
 //number of simultaneous requests we make to server when retrieving activity history
-const PGCR_REQUEST_CHUNK_AMOUNT: usize = 50;
+//Reduced from 100 to 25 to avoid Bungie API rate limiting
+const PGCR_REQUEST_CHUNK_AMOUNT: usize = 25;
 
 const DB_SCHEMA_VERSION: i32 = 10;
 const NO_TEAMS_INDEX: i32 = 253;
@@ -304,6 +306,44 @@ impl ActivityStoreInterface {
         Ok(out)
     }
 
+    /// Sync a player with granular progress reporting.
+    /// The callback is invoked at each major phase of the sync operation.
+    pub async fn sync_player_with_progress<F>(
+        &mut self,
+        player: &PlayerName,
+        on_progress: F,
+    ) -> Result<SyncResult, Error>
+    where
+        F: Fn(SyncProgress),
+    {
+        on_progress(SyncProgress::Starting);
+
+        let member = match self.find_member(player, false).await {
+            Ok(m) => m,
+            Err(e) => {
+                on_progress(SyncProgress::Failed {
+                    message: format!("{:?}", e),
+                });
+                return Err(e);
+            }
+        };
+
+        match self.sync_member_with_progress(&member, &on_progress).await {
+            Ok(result) => {
+                on_progress(SyncProgress::Complete {
+                    total_synced: result.total_synced,
+                });
+                Ok(result)
+            }
+            Err(e) => {
+                on_progress(SyncProgress::Failed {
+                    message: format!("{:?}", e),
+                });
+                Err(e)
+            }
+        }
+    }
+
     //select all members where sync member = memberid
     pub async fn sync_all(&mut self) -> Result<(), Error> {
         let members: Vec<Member> = self.get_sync_members().await?;
@@ -357,7 +397,7 @@ impl ActivityStoreInterface {
     ) -> Result<(), Error> {
         let row_option = sqlx::query(
             r#"
-            SELECT "member_id" from "member" 
+            SELECT "member_id" from "member"
             where bungie_display_name = ? and bungie_display_name_code = ?
         "#,
         )
@@ -376,9 +416,25 @@ impl ActivityStoreInterface {
             }
         };
 
+        // Delete from sync table first
         sqlx::query(
             r#"
             delete from "sync" where member = ?
+        "#,
+        )
+        .bind(id)
+        .execute(&mut self.db)
+        .await?;
+
+        // Delete the member record, which will cascade delete all related data:
+        // - characters (via ON DELETE CASCADE)
+        // - character_activity_stats (via ON DELETE CASCADE on character)
+        // - weapon_result (via ON DELETE CASCADE on character_activity_stats)
+        // - medal_result (via ON DELETE CASCADE on character_activity_stats)
+        // - activity_queue (via ON DELETE CASCADE on character)
+        sqlx::query(
+            r#"
+            delete from "member" where member_id = ?
         "#,
         )
         .bind(id)
@@ -466,16 +522,93 @@ impl ActivityStoreInterface {
         );
         tell::progress!("This may take a few minutes depending on the number of activities.");
 
-        for c in characters.characters {
-            let character_id = &c.id;
-            self.insert_character(&c.id, &c.class_type, &member).await?;
-            tell::progress!("{}", format!("[{}]", c.class_type).to_uppercase());
+        for char_info in characters.characters {
+            let character_id = &char_info.id;
+            self.insert_character(
+                &char_info.id,
+                &char_info.class_type,
+                &member,
+            )
+            .await?;
+            tell::progress!(
+                "{}",
+                format!("[{}]", char_info.class_type).to_uppercase()
+            );
 
             //these calls could be a little more general purpose by taking api ids and not db ids.
             //however, passing the db ids, lets us optimize a lot of the sql, and avoid
             //some extra calls to the DB
 
-            let a = self.sync_activities(character_id).await?;
+            let sync_result_a = self.sync_activities(character_id).await?;
+
+            let _queue_result = self
+                .update_activity_queue(
+                    &member.id,
+                    character_id,
+                    &member.platform,
+                )
+                .await?;
+
+            let sync_result_b = self.sync_activities(character_id).await?;
+
+            total_synced +=
+                sync_result_a.total_synced + sync_result_b.total_synced;
+            total_in_queue += (sync_result_a.total_available
+                + sync_result_b.total_available)
+                - (sync_result_a.total_synced + sync_result_b.total_synced);
+        }
+
+        self.update_sync_entry(&member.id).await?;
+
+        Ok(SyncResult {
+            total_synced,
+            total_available: total_in_queue,
+        })
+    }
+
+    /// Sync member with progress reporting callback.
+    async fn sync_member_with_progress<F>(
+        &mut self,
+        member: &Member,
+        on_progress: &F,
+    ) -> Result<SyncResult, Error>
+    where
+        F: Fn(SyncProgress),
+    {
+        let player_info = self
+            .api_interface
+            .get_player_info(&member.id, &member.platform)
+            .await?;
+
+        let characters = player_info.characters;
+
+        self.insert_member(&player_info.user_info.to_member())
+            .await?;
+
+        let mut total_synced = 0;
+        let mut total_in_queue = 0;
+        let character_count = characters.characters.len() as u8;
+
+        tell::update!(
+            "CHECKING FOR NEW ACTIVITIES FOR {} (PUBLIC AND PRIVATE)",
+            member.name.get_bungie_name()
+        );
+
+        for (index, c) in characters.characters.iter().enumerate() {
+            let character_id = &c.id;
+            self.insert_character(&c.id, &c.class_type, member).await?;
+
+            on_progress(SyncProgress::FetchingHistory {
+                character_index: index as u8 + 1,
+                character_count,
+                class_name: format!("{}", c.class_type).to_uppercase(),
+            });
+
+            tell::progress!("{}", format!("[{}]", c.class_type).to_uppercase());
+
+            let a = self
+                .sync_activities_with_progress(character_id, on_progress)
+                .await?;
 
             let _b = self
                 .update_activity_queue(
@@ -485,11 +618,13 @@ impl ActivityStoreInterface {
                 )
                 .await?;
 
-            let c = self.sync_activities(character_id).await?;
+            let c_result = self
+                .sync_activities_with_progress(character_id, on_progress)
+                .await?;
 
-            total_synced += a.total_synced + c.total_synced;
-            total_in_queue += (a.total_available + c.total_available)
-                - (a.total_synced + c.total_synced);
+            total_synced += a.total_synced + c_result.total_synced;
+            total_in_queue += (a.total_available + c_result.total_available)
+                - (a.total_synced + c_result.total_synced);
         }
 
         self.update_sync_entry(&member.id).await?;
@@ -517,6 +652,8 @@ impl ActivityStoreInterface {
                         "activity_queue"
                     WHERE
                         character = ? AND synced = 0
+                    ORDER BY
+                        activity_id DESC
                 "#,
             )
             .bind(character_id)
@@ -582,45 +719,45 @@ impl ActivityStoreInterface {
 
             //tell::progress!(".");
 
-            //TODO: look into using threading for this
             let results = futures::future::join_all(f).await;
 
-            //loop through. if we get results. grab those, otherwise, we ignore
-            //any errors, as that will keep the IDs in the queue to try next time
-            //TODO: this is a mess. can we simpify and not nest so deeply?
+            // Collect successful PGCR fetches for batch insert
+            let mut activities_to_insert: Vec<
+                DestinyPostGameCarnageReportData,
+            > = Vec::with_capacity(results.len());
+
             for r in results {
                 match r {
-                    Ok(e) => {
-                        match e {
-                            Some(mut e) => match self
-                                .insert_activity(&mut e, character_id)
-                                .await
-                            {
-                                Ok(_e) => {
-                                    total_synced += 1;
-                                }
-                                Err(e) => {
-                                    tell::error!(
-                                        "Error inserting data into character activity stats table. Skipping. : {}",
-                                        e,
-                                    );
-                                }
-                            },
-                            None => {
-                                tell::error!(
-                                    "PGCR returned empty response. Ignoring."
-                                );
-                                //TODO: should not get here, as none means either an API error
-                                //occured or there is no data associated with the ID (which is
-                                //an api data error).
-                                //we will just ignore it here, with the assumption that any error
-                                //is temporary, and will be fixed next time we sync
-                            }
-                        }
+                    Ok(Some(e)) => activities_to_insert.push(e),
+                    Ok(None) => {
+                        tell::error!("PGCR returned empty response. Ignoring.");
                     }
                     Err(_) => {
                         tell::error!(
-                            "Error retrieving activity details from api. Skipping.");
+                            "Error retrieving activity details from api. Skipping."
+                        );
+                    }
+                }
+            }
+
+            // Batch insert all fetched activities in a single transaction
+            // Use match instead of ? to prevent early return on batch errors
+            // Failed activities remain in queue for retry on next sync
+            if !activities_to_insert.is_empty() {
+                match self
+                    .insert_activities_batch(
+                        &mut activities_to_insert,
+                        character_id,
+                    )
+                    .await
+                {
+                    Ok(count) => total_synced += count,
+                    Err(e) => {
+                        tell::error!(
+                            "Error inserting activity batch for character {}. Continuing with next chunk: {}",
+                            character_id,
+                            e
+                        );
                     }
                 }
             }
@@ -629,9 +766,169 @@ impl ActivityStoreInterface {
         pb.finish_and_clear();
 
         if !ids.is_empty() {
-            sqlx::query("PRAGMA OPTIMIZE;")
-                .execute(&mut self.db)
-                .await?;
+            if let Err(e) =
+                sqlx::query("PRAGMA OPTIMIZE;").execute(&mut self.db).await
+            {
+                tell::error!("PRAGMA OPTIMIZE failed: {}", e);
+            }
+        }
+
+        Ok(SyncResult {
+            total_available,
+            total_synced,
+        })
+    }
+
+    /// Download and sync activities with progress reporting
+    async fn sync_activities_with_progress<F>(
+        &mut self,
+        character_id: &i64,
+        on_progress: &F,
+    ) -> Result<SyncResult, Error>
+    where
+        F: Fn(SyncProgress),
+    {
+        let mut ids: Vec<i64> = Vec::new();
+
+        {
+            let mut rows = sqlx::query(
+                r#"
+                    SELECT
+                        "activity_id"
+                    FROM
+                        "activity_queue"
+                    WHERE
+                        character = ? AND synced = 0
+                    ORDER BY
+                        activity_id DESC
+                "#,
+            )
+            .bind(character_id)
+            .fetch(&mut self.db);
+
+            while let Some(row) = rows.try_next().await? {
+                let activity_id: i64 = row.try_get("activity_id")?;
+                ids.push(activity_id);
+            }
+        };
+
+        if ids.is_empty() {
+            return Ok(SyncResult {
+                total_available: 0,
+                total_synced: 0,
+            });
+        }
+
+        let mut filtered_ids = Vec::new();
+
+        for id in ids {
+            if self.has_activity(&id).await {
+                self.remove_from_activity_queue(character_id, &id).await?;
+                continue;
+            } else {
+                filtered_ids.push(id)
+            }
+        }
+        ids = filtered_ids;
+
+        let total_available = ids.len() as u32;
+        let mut total_synced = 0;
+
+        use std::fmt::Write;
+
+        let pb = if Tell::is_active(TellLevel::Progress) {
+            ProgressBar::new(ids.len() as u64)
+        } else {
+            ProgressBar::hidden()
+        };
+
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {human_pos}/{human_len} ETA:({eta_precise})",
+            )
+            .unwrap()
+            .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
+                write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap()
+            })
+            .progress_chars("#>-"),
+        );
+
+        let mut downloaded_count: u32 = 0;
+
+        for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
+            // Report downloading progress
+            on_progress(SyncProgress::DownloadingActivities {
+                current: downloaded_count,
+                total: total_available,
+            });
+
+            let mut f = Vec::new();
+
+            for c in id_chunks {
+                f.push(
+                    self.api_interface.retrieve_post_game_carnage_report(*c),
+                );
+            }
+
+            downloaded_count += id_chunks.len() as u32;
+            pb.set_position(downloaded_count as u64);
+
+            let results = futures::future::join_all(f).await;
+
+            let mut activities_to_insert: Vec<
+                DestinyPostGameCarnageReportData,
+            > = Vec::with_capacity(results.len());
+
+            for r in results {
+                match r {
+                    Ok(Some(e)) => activities_to_insert.push(e),
+                    Ok(None) => {
+                        tell::error!("PGCR returned empty response. Ignoring.");
+                    }
+                    Err(_) => {
+                        tell::error!(
+                            "Error retrieving activity details from api. Skipping."
+                        );
+                    }
+                }
+            }
+
+            // Report saving progress
+            // Use match instead of ? to prevent early return on batch errors
+            // Failed activities remain in queue for retry on next sync
+            if !activities_to_insert.is_empty() {
+                on_progress(SyncProgress::SavingActivities {
+                    current: total_synced,
+                    total: total_available,
+                });
+
+                match self
+                    .insert_activities_batch(
+                        &mut activities_to_insert,
+                        character_id,
+                    )
+                    .await
+                {
+                    Ok(count) => total_synced += count,
+                    Err(e) => {
+                        tell::error!(
+                            "Error inserting activity batch for character {}. Continuing with next chunk: {}",
+                            character_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        pb.finish_and_clear();
+
+        if !ids.is_empty() {
+            if let Err(e) =
+                sqlx::query("PRAGMA OPTIMIZE;").execute(&mut self.db).await
+            {
+                tell::error!("PRAGMA OPTIMIZE failed: {}", e);
+            }
         }
 
         Ok(SyncResult {
@@ -697,6 +994,12 @@ impl ActivityStoreInterface {
         mode: &Mode,
     ) -> Result<SyncResult, Error> {
         let max_id: i64 = self.get_max_activity_id(character_id, mode).await?;
+        tell::update!(
+            "DEBUG: _update_activity_queue mode={:?} max_id={} character_id={}",
+            mode,
+            max_id,
+            character_id
+        );
 
         let result = self
             .api_interface
@@ -710,6 +1013,7 @@ impl ActivityStoreInterface {
             .await?;
 
         if result.is_none() {
+            tell::update!("DEBUG: No activities found for mode={:?}", mode);
             return Ok(SyncResult {
                 total_available: 0,
                 total_synced: 0,
@@ -717,10 +1021,23 @@ impl ActivityStoreInterface {
         }
 
         let mut activities = result.unwrap();
-        //tell::progress!(format!("{} new activities found", activities.len()));
+        tell::update!(
+            "DEBUG: Found {} activities for mode={:?}",
+            activities.len(),
+            mode
+        );
 
         //reverse them so we add the oldest first
         activities.reverse();
+
+        // DEBUG: Count queue size before insert
+        let queue_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
 
         // TODO: think through this
         // Right now, we do all inserts in one transaction. This gives a significant performance
@@ -781,6 +1098,19 @@ impl ActivityStoreInterface {
         }
         sqlx::query("COMMIT;").execute(&mut self.db).await?;
 
+        // DEBUG: Count queue size after insert
+        let queue_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        let actually_inserted = queue_after - queue_before;
+        tell::update!("DEBUG: Queue insert complete. Before={} After={} Actually inserted={} (tried to insert {})",
+            queue_before, queue_after, actually_inserted, total);
+
         Ok(SyncResult {
             total_available: total,
             total_synced: total,
@@ -799,25 +1129,41 @@ impl ActivityStoreInterface {
         }
     }
 
-    async fn insert_activity(
+    /// Batch insert multiple activities in a single transaction for improved performance.
+    /// Returns the count of successfully inserted activities.
+    /// Failed inserts are logged but don't stop the batch - those activities remain
+    /// in the queue for retry on next sync.
+    async fn insert_activities_batch(
         &mut self,
-        data: &mut DestinyPostGameCarnageReportData,
+        activities: &mut [DestinyPostGameCarnageReportData],
         character_id: &i64,
-    ) -> Result<(), Error> {
-        sqlx::query("BEGIN TRANSACTION;")
-            .execute(&mut self.db)
-            .await?;
+    ) -> Result<u32, Error> {
+        if activities.is_empty() {
+            return Ok(0);
+        }
 
-        match self._insert_activity(data, character_id).await {
-            Ok(_e) => {
-                sqlx::query("COMMIT;").execute(&mut self.db).await?;
-                Ok(())
-            }
-            Err(e) => {
-                sqlx::query("ROLLBACK;").execute(&mut self.db).await?;
-                Err(e)
+        self.begin_transaction().await?;
+
+        let mut success_count: u32 = 0;
+        for activity in activities.iter_mut() {
+            match self._insert_activity(activity, character_id).await {
+                Ok(_) => {
+                    success_count += 1;
+                }
+                Err(e) => {
+                    // Log error but continue with batch - activity stays in queue for retry
+                    tell::error!(
+                        "Error inserting activity {}. Skipping: {}",
+                        activity.activity_details.instance_id,
+                        e
+                    );
+                }
             }
         }
+
+        self.commit_transaction().await?;
+
+        Ok(success_count)
     }
 
     fn remove_from_modes(
@@ -963,28 +1309,28 @@ impl ActivityStoreInterface {
             == COMPETITIVE_PVP_ACTIVITY_HASH
             || activity.activity_details.director_activity_hash
                 == FREELANCE_COMPETITIVE_PVP_ACTIVITY_HASH
+            || activity.activity_details.director_activity_hash
+                == COMPETITIVE_PVP_ACTIVITY_HASH_S25
         {
-
             /*
-            	out.activityDetails.addToModes(mode: Mode.competitive.rawValue);
-			
-			if out.activityDetails.mode == Mode.zoneControl.rawValue {
-				out.activityDetails.setMode(mode: Mode.competitiveCollision.rawValue)
-				
-				//fix generic activity hash set (competitive)
-				out.activityDetails.setDirectorActivityHash(hash: collisionActivityHash)
-			}
-			
-			if out.activityDetails.mode == Mode.clashQuickplay.rawValue {
-				out.activityDetails.removeFromModes(mode: Mode.clashQuickplay.rawValue)
-				out.activityDetails.removeFromModes(mode: Mode.quickplay.rawValue)
-				out.activityDetails.setMode(mode: Mode.competitiveClash.rawValue)
-				
-				//fix generic activity hash set (competitive)
-				out.activityDetails.setDirectorActivityHash(hash: clashActivityHash)
-			}
+                out.activityDetails.addToModes(mode: Mode.competitive.rawValue);
+
+            if out.activityDetails.mode == Mode.zoneControl.rawValue {
+                out.activityDetails.setMode(mode: Mode.competitiveCollision.rawValue)
+
+                //fix generic activity hash set (competitive)
+                out.activityDetails.setDirectorActivityHash(hash: collisionActivityHash)
+            }
+
+            if out.activityDetails.mode == Mode.clashQuickplay.rawValue {
+                out.activityDetails.removeFromModes(mode: Mode.clashQuickplay.rawValue)
+                out.activityDetails.removeFromModes(mode: Mode.quickplay.rawValue)
+                out.activityDetails.setMode(mode: Mode.competitiveClash.rawValue)
+
+                //fix generic activity hash set (competitive)
+                out.activityDetails.setDirectorActivityHash(hash: clashActivityHash)
+            }
              */
-            
 
             if activity.activity_details.mode == Mode::ZoneControl {
                 self.set_mode(activity, Mode::CollisionCompetitive);
@@ -1089,6 +1435,44 @@ impl ActivityStoreInterface {
             was_updated = self.fix_private_match(activity);
         }
 
+        // CRITICAL FIX: Ensure parent modes are present for proper stats querying
+        // The Bungie API returns activities when querying by mode (e.g., AllPvP=5),
+        // but the PGCR's modes array may not include that parent mode.
+        // This causes activities to be synced but not counted in stats queries.
+
+        let has_all_pvp = activity
+            .activity_details
+            .modes
+            .iter()
+            .any(|m| *m == Mode::AllPvP);
+        let is_private = activity.activity_details.is_private;
+
+        // Add AllPvP (mode 5) to all non-private Crucible activities that don't have it
+        if !has_all_pvp && !is_private {
+            // Use canonical is_crucible() to detect PvP activities
+            let is_pvp_activity = activity
+                .activity_details
+                .modes
+                .iter()
+                .any(|m| m.is_crucible());
+
+            if is_pvp_activity {
+                self.add_to_modes(activity, Mode::AllPvP);
+                was_updated = true;
+            }
+        }
+
+        // Ensure PrivateMatchesAll (mode 32) is present for private matches
+        let has_private_all = activity
+            .activity_details
+            .modes
+            .iter()
+            .any(|m| *m == Mode::PrivateMatchesAll);
+        if !has_private_all && is_private {
+            self.add_to_modes(activity, Mode::PrivateMatchesAll);
+            was_updated = true;
+        }
+
         was_updated
     }
 
@@ -1140,6 +1524,30 @@ impl ActivityStoreInterface {
         }
 
         //TODO: Rumble will have no teams. Need to create one
+
+        // DEBUG: Check if AllPvP (5) or PrivateMatchesAll (32) are in modes
+        let has_all_pvp = data
+            .activity_details
+            .modes
+            .iter()
+            .any(|m| *m == Mode::AllPvP);
+        let has_private_all = data
+            .activity_details
+            .modes
+            .iter()
+            .any(|m| *m == Mode::PrivateMatchesAll);
+        let mode_ids: Vec<u32> = data
+            .activity_details
+            .modes
+            .iter()
+            .map(|m| m.as_id())
+            .collect();
+
+        // Only log first few to avoid spam - log if missing expected parent modes
+        if !has_all_pvp && !has_private_all {
+            tell::update!("DEBUG: Activity {} has NO parent mode (AllPvP or PrivateMatchesAll). Modes: {:?}",
+                activity_id, mode_ids);
+        }
 
         for mode in &data.activity_details.modes {
             sqlx::query(
@@ -1287,47 +1695,52 @@ impl ActivityStoreInterface {
 
         let character_activity_stats_id: i32 = row.try_get("id")?;
 
-        for (key, value) in medal_hash {
-            sqlx::query(
-                r#"
-                INSERT INTO "main"."medal_result"
-                (
-                    "reference_id", "count", "character_activity_stats"
-                )
-                VALUES  (
-                    ?,?,?
-                )
-                "#,
-            )
-            .bind(key) //reference_id
-            .bind(format!("{}", value.basic.value as u32)) //unique_weapon_kills
-            .bind(character_activity_stats_id)
-            .execute(&mut self.db)
-            .await?;
+        // Bulk insert medals using QueryBuilder for better performance
+        if !medal_hash.is_empty() {
+            let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+                r#"INSERT INTO "main"."medal_result" ("reference_id", "count", "character_activity_stats") "#,
+            );
+
+            query_builder.push_values(
+                medal_hash.iter(),
+                |mut b, (key, value)| {
+                    b.push_bind(key.clone())
+                        .push_bind(format!("{}", value.basic.value as u32))
+                        .push_bind(character_activity_stats_id);
+                },
+            );
+
+            query_builder.build().execute(&mut self.db).await?;
         }
 
-        //ran into a case once where weapons was missing, so have to check here
+        // Bulk insert weapons using QueryBuilder for better performance
         if entry.extended.is_some() {
             let extended = char_data.extended.as_ref().unwrap();
-            if extended.weapons.is_some() {
-                let weapons = extended.weapons.as_ref().unwrap();
-                for w in weapons {
-                    sqlx::query(
-                        r#"
-                        INSERT INTO "main"."weapon_result"
-                        (
-                            "reference_id", "kills", "precision_kills", "kills_precision_kills_ratio", "character_activity_stats"
-                        )
-                        VALUES (?, ?, ?, ?, ?)
-                        "#,
-                    )
-                    .bind(format!("{}", w.reference_id)) //reference_id
-                    .bind(format!("{}", w.values.unique_weapon_kills as u32)) //unique_weapon_kills
-                    .bind(format!("{}", w.values.unique_weapon_precision_kills as u32)) //unique_weapon_precision_kills
-                    .bind(format!("{}", w.values.unique_weapon_kills_precision_kills)) //unique_weapon_kills_precision_kills
-                    .bind(character_activity_stats_id)
-                    .execute(&mut self.db)
-                    .await?;
+            if let Some(weapons) = &extended.weapons {
+                if !weapons.is_empty() {
+                    let mut query_builder: QueryBuilder<Sqlite> =
+                        QueryBuilder::new(
+                            r#"INSERT INTO "main"."weapon_result" ("reference_id", "kills", "precision_kills", "kills_precision_kills_ratio", "character_activity_stats") "#,
+                        );
+
+                    query_builder.push_values(weapons.iter(), |mut b, w| {
+                        b.push_bind(format!("{}", w.reference_id))
+                            .push_bind(format!(
+                                "{}",
+                                w.values.unique_weapon_kills as u32
+                            ))
+                            .push_bind(format!(
+                                "{}",
+                                w.values.unique_weapon_precision_kills as u32
+                            ))
+                            .push_bind(format!(
+                                "{}",
+                                w.values.unique_weapon_kills_precision_kills
+                            ))
+                            .push_bind(character_activity_stats_id);
+                    });
+
+                    query_builder.build().execute(&mut self.db).await?;
                 }
             }
         }
@@ -1509,6 +1922,42 @@ impl ActivityStoreInterface {
         character_id: &i64,
         mode: &Mode,
     ) -> Result<i64, Error> {
+        // DEBUG: Count activities in queue for this character
+        let queue_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        // DEBUG: Count synced activities for this character
+        let synced_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activity_queue WHERE character = ? AND synced = 1"
+        )
+        .bind(character_id)
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        // DEBUG: Count activities with this specific mode
+        let mode_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(DISTINCT modes.activity)
+            FROM modes
+            INNER JOIN activity_queue ON modes.activity = activity_queue.activity_id
+            WHERE activity_queue.character = ? AND modes.mode = ?
+            "#
+        )
+        .bind(character_id)
+        .bind(mode.as_id())
+        .fetch_one(&mut self.db)
+        .await
+        .unwrap_or(0);
+
+        tell::update!("DEBUG: get_max_activity_id char={} mode={:?}({}) queue_total={} synced={} with_mode={}",
+            character_id, mode, mode.as_id(), queue_count, synced_count, mode_count);
+
         let rows = sqlx::query(
             r#"
             SELECT
@@ -1533,11 +1982,16 @@ impl ActivityStoreInterface {
         .await?;
 
         if rows.is_empty() {
+            tell::update!(
+                "DEBUG: get_max_activity_id returning 0 (no matching rows)"
+            );
             return Ok(0);
         }
 
         let row = &rows[0];
         let activity_id: i64 = row.try_get("max_activity_id")?;
+
+        tell::update!("DEBUG: get_max_activity_id returning {}", activity_id);
 
         Ok(activity_id)
     }
@@ -2349,6 +2803,56 @@ impl std::ops::Add<SyncResult> for SyncResult {
         SyncResult {
             total_available: self.total_available + sr.total_available,
             total_synced: self.total_synced + sr.total_synced,
+        }
+    }
+}
+
+/// Progress updates during sync operations.
+/// Designed to provide granular feedback for mobile apps.
+#[derive(Debug, Clone)]
+pub enum SyncProgress {
+    /// Starting sync for a player
+    Starting,
+    /// Fetching activity history for a character
+    FetchingHistory {
+        character_index: u8,
+        character_count: u8,
+        class_name: String,
+    },
+    /// Downloading activity details (PGCRs)
+    DownloadingActivities { current: u32, total: u32 },
+    /// Saving activities to database
+    SavingActivities { current: u32, total: u32 },
+    /// Sync completed successfully
+    Complete { total_synced: u32 },
+    /// Sync failed with error
+    Failed { message: String },
+}
+
+impl SyncProgress {
+    /// Convert to a simple (message, current, total) tuple for FFI compatibility
+    pub fn to_progress_tuple(&self) -> (&str, u32, u32) {
+        match self {
+            SyncProgress::Starting => ("Starting sync...", 0, 100),
+            SyncProgress::FetchingHistory {
+                character_index,
+                character_count,
+                class_name,
+            } => {
+                // We'll return static str, caller can format if needed
+                let _ = (character_index, character_count, class_name);
+                ("Fetching activity history...", 0, 100)
+            }
+            SyncProgress::DownloadingActivities { current, total } => {
+                ("Downloading activities...", *current, *total)
+            }
+            SyncProgress::SavingActivities { current, total } => {
+                ("Saving to database...", *current, *total)
+            }
+            SyncProgress::Complete { total_synced } => {
+                ("Sync complete!", *total_synced, *total_synced)
+            }
+            SyncProgress::Failed { .. } => ("Sync failed", 0, 100),
         }
     }
 }

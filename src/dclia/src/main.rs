@@ -31,18 +31,18 @@ use dcli::manifest::definitions::{
     ActivityDefinitionData, DestinationDefinitionData, PlaceDefinitionData,
 };
 //use dcli::error::Error;
+use clap::Parser;
 use dcli::enums::mode::Mode;
 use dcli::manifestinterface::ManifestInterface;
 use dcli::output::Output;
 use dcli::response::gpr::CharacterActivitiesData;
 use dcli::utils::{build_tsv, determine_data_dir};
 use dcli::utils::{format_error, EXIT_FAILURE};
-use structopt::StructOpt;
 
 const ORBIT_PLACE_HASH: u32 = 2961497387;
 
-#[derive(StructOpt, Debug)]
-#[structopt(verbatim_doc_comment)]
+#[derive(Parser, Debug)]
+#[command(about, verbatim_doc_comment)]
 /// Command line tool for retrieving current Destiny 2 activity status for player.
 ///
 /// Created by Mike Chambers.
@@ -61,12 +61,11 @@ struct Opt {
     /// Name must be in the format of NAME#CODE. Example: foo#3280
     /// You can find your name in game, or on Bungie's site at:
     /// https://www.bungie.net/7/en/User/Account/IdentitySettings
-    #[structopt(long = "name", short = "n", required = true)]
+    #[arg(long = "name", short = 'n')]
     name: PlayerName,
 
     ///Print out additional information
-
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
     /// Directory where Destiny 2 manifest database file is stored. (optional)
@@ -74,7 +73,7 @@ struct Opt {
     /// This will normally be downloaded using the dclim tool, and stored in a file
     /// named manifest.sqlite3 (in the manifest directory specified when running
     /// dclim).
-    #[structopt(short = "D", long = "data-dir", parse(from_os_str))]
+    #[arg(short = 'D', long = "data-dir")]
     data_dir: Option<PathBuf>,
 
     /// Format for command output
@@ -83,11 +82,7 @@ struct Opt {
     ///
     /// tsv outputs in a tab (\t) separated format of name / value pairs with lines
     /// ending in a new line character (\n).
-    #[structopt(
-        short = "O",
-        long = "output-format",
-        default_value = "default"
-    )]
+    #[arg(short = 'O', long = "output-format", default_value = "default")]
     output: Output,
 
     /// API key from Bungie required for some actions.
@@ -95,13 +90,13 @@ struct Opt {
     /// If specified the key will be passed to all Destiny API calls.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[structopt(short = "k", long = "api-key", env = "DESTINY_API_KEY")]
+    #[arg(short = 'k', long = "api-key", env = "DESTINY_API_KEY")]
     api_key: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let level = if opt.verbose {
         TellLevel::Verbose

@@ -28,17 +28,17 @@ use std::thread;
 use std::time::Duration;
 use tell::{Tell, TellLevel};
 
+use clap::Parser;
 use dcli::activitystoreinterface::ActivityStoreInterface;
 use dcli::apiinterface::ApiInterface;
 use dcli::crucible::{Member, PlayerName};
 use dcli::utils::{determine_data_dir, format_error, EXIT_FAILURE};
-use structopt::StructOpt;
 
 const DEFAULT_REFRESH_INTERVAL: u32 = 60;
 const SHOULD_CONTINUE_CODE: i32 = -1;
 
-#[derive(StructOpt, Debug)]
-#[structopt(verbatim_doc_comment)]
+#[derive(Parser, Debug)]
+#[command(about, verbatim_doc_comment)]
 /// Command line tool for downloading and syncing Destiny 2 Crucible activity
 /// history to a sqlite3 database file.
 ///
@@ -65,7 +65,7 @@ const SHOULD_CONTINUE_CODE: i32 = -1;
 /// Released under an MIT License.
 struct Opt {
     /// Print out additional information
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
     /// Directory where activity sqlite3 database will be stored. (optional)
@@ -73,7 +73,7 @@ struct Opt {
     /// By default data will be loaded from and stored in the appropriate system
     /// local storage directory. Data will be stored in a sqlite3 database file
     /// named dcli.sqlite3
-    #[structopt(short = "D", long = "data-dir", parse(from_os_str))]
+    #[arg(short = 'D', long = "data-dir")]
     data_dir: Option<PathBuf>,
 
     /// Sync player activities.
@@ -90,13 +90,11 @@ struct Opt {
     /// or DESTINY_API_KEY environment variable.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[structopt(
+    #[arg(
         long = "sync",
-        short = "s",
-        //conflicts_with_all = &["add", "remove", "list"],
-        //required_unless_one=&["list", "add", "remove"],`
-        required_unless_one = &["list", "add", "remove", "import-group"],
-        requires="api-key"
+        short = 's',
+        required_unless_present_any = ["list", "add", "remove", "import_group"],
+        requires = "api_key"
     )]
     sync: Option<Vec<PlayerName>>,
 
@@ -111,11 +109,7 @@ struct Opt {
     /// or DESTINY_API_KEY environment variable.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[structopt(long = "add", short = "A", 
-        //conflicts_with_all = &["sync", "remove"], 
-        //required_unless_one=&["sync", "list", "remove"]
-        requires="api-key"
-    )]
+    #[arg(long = "add", short = 'A', requires = "api_key")]
     add: Option<Vec<PlayerName>>,
 
     /// Remove specified player(s) from having their activities synced.
@@ -126,26 +120,20 @@ struct Opt {
     /// Name(s) must be in the format of NAME#CODE. Example: foo#3280
     /// You can find your name in game, or on Bungie's site at:
     /// https://www.bungie.net/7/en/User/Account/IdentitySettings
-    #[structopt(long = "remove", short = "r", 
-        //required_unless_one = &["sync", "add", "list"], 
-        //conflicts_with_all = &["sync", "add"],
-    )]
+    #[arg(long = "remove", short = 'r')]
     remove: Option<Vec<PlayerName>>,
 
     ///List all Bungie names which are flagged to be synced.
-    #[structopt(short = "l", long = "list", 
-        //required_unless_one = &["sync", "add", "remove"], 
-        //conflicts_with_all = &["sync"]
-    )]
+    #[arg(short = 'l', long = "list")]
     list: bool,
 
     ///Run dclisync in daemon mode. dclisync will run continuously with a
     /// pause (specified by --interval) between syncs
-    #[structopt(short = "d", long = "daemon")]
+    #[arg(short = 'd', long = "daemon")]
     daemon: bool,
 
     ///Interval in seconds between player syncs when running in daemon mode.
-    #[structopt(short = "I", long = "interval")]
+    #[arg(short = 'I', long = "interval")]
     interval: Option<u32>,
 
     /// Import all players for specified Destiny 2 Group / clan.
@@ -158,19 +146,19 @@ struct Opt {
     /// or DESTINY_API_KEY environment variable.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[structopt(short = "i", long = "import-group", requires = "api-key")]
+    #[arg(short = 'i', long = "import-group", requires = "api_key")]
     import_group: Option<u32>,
 
     /// API key from Bungie required for some actions.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[structopt(short = "k", long = "api-key", env = "DESTINY_API_KEY")]
+    #[arg(short = 'k', long = "api-key", env = "DESTINY_API_KEY")]
     api_key: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     env_logger::init();
 
     let level = if opt.verbose {

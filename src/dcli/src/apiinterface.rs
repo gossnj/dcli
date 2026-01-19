@@ -31,7 +31,6 @@ use chrono::{DateTime, Utc};
 use indicatif::{HumanCount, ProgressBar, ProgressStyle};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use crate::response::{gpr::{CharacterActivitiesData, GetProfileResponse}, cr::GetCharacterResponse};
 use crate::response::pgcr::{DestinyPostGameCarnageReportData, PGCRResponse};
 use crate::response::sdpr::{
     DestinyLinkedProfilesResponse, LinkedProfilesResponse,
@@ -46,6 +45,10 @@ use crate::response::{
     sdpr::SearchDestinyPlayerPostData,
 };
 use crate::response::{character::CharacterData, gmd::GetMembershipData};
+use crate::response::{
+    cr::GetCharacterResponse,
+    gpr::{CharacterActivitiesData, GetProfileResponse},
+};
 use crate::response::{
     ggms::{GetGroupMemberResponse, GroupMemberResponse},
     gmd::UserMembershipData,
@@ -348,26 +351,23 @@ impl ApiInterface {
 
     pub async fn retrieve_character(
         &self,
-        member:&Member,
+        member: &Member,
         character_id: &i64,
     ) -> Result<Option<CharacterData>, Error> {
-
         let url = format!(
             "{base}/Platform/Destiny2/{platform_id}/Profile/{member_id}/Character/{character_id}/?components=200",
 
-            
+
             base = API_BASE_URL,
             platform_id = member.platform.as_id(),
             member_id = member.id,
             character_id = character_id
         );
 
-        
-
         let profile: GetCharacterResponse = self
-        .client
-        .call_and_parse::<GetCharacterResponse>(&url)
-        .await?;
+            .client
+            .call_and_parse::<GetCharacterResponse>(&url)
+            .await?;
 
         let response = match profile.response {
             Some(e) => e,
@@ -380,10 +380,8 @@ impl ApiInterface {
             }
         };
 
-        
-
         if response.character.is_none() {
-            return Ok(None)
+            return Ok(None);
         }
 
         Ok(response.character.unwrap().data)
@@ -643,8 +641,14 @@ impl ApiInterface {
             //move the items from the temp vec to the out
             out.append(&mut t);
 
-            if should_break || len < count {
+            if should_break {
                 break;
+            }
+
+            // Don't break on partial pages - Bungie API sometimes returns < 250 even when
+            // there's more history. Continue until we find our target time or get 0 activities.
+            if len < count {
+                tell::update!("DEBUG: Page {} had {} activities (< {}), continuing anyway. Total: {}", page, len, count, out.len());
             }
 
             page += 1;
@@ -689,6 +693,10 @@ impl ApiInterface {
         pb.set_message("Searching for new activities.");
 
         //TODO: if error occurs on an individual call, retry?
+        tell::update!(
+            "DEBUG: Starting activity fetch, looking for activity_id={}",
+            activity_id
+        );
         loop {
             //tell::progress!(".");
             io::stderr().flush().unwrap();
@@ -714,6 +722,11 @@ impl ApiInterface {
             pb.inc(1);
 
             if activities.is_none() {
+                tell::update!(
+                    "DEBUG: Page {} returned None, breaking. Total so far: {}",
+                    page,
+                    out.len()
+                );
                 break;
             }
 
@@ -723,12 +736,14 @@ impl ApiInterface {
 
             //todo: this seems redundant from check above
             if len == 0 {
+                tell::update!("DEBUG: Page {} returned 0 activities, breaking. Total so far: {}", page, out.len());
                 break;
             }
 
             let mut should_break = false;
             for activity in t.into_iter() {
                 if activity.details.instance_id == activity_id {
+                    tell::update!("DEBUG: Found target activity_id={} on page {}, breaking. Total: {}", activity_id, page, out.len());
                     should_break = true;
                     break;
                 }
@@ -736,8 +751,14 @@ impl ApiInterface {
                 out.push(activity);
             }
 
-            if should_break || len < count {
+            if should_break {
                 break;
+            }
+
+            // Don't break on partial pages - Bungie API sometimes returns < 250 even when
+            // there's more history. Continue until we get None or 0 activities.
+            if len < count {
+                tell::update!("DEBUG: Page {} had {} activities (< {}), continuing anyway. Total: {}", page, len, count, out.len());
             }
 
             page += 1;
@@ -747,8 +768,7 @@ impl ApiInterface {
                 HumanCount(out.len() as u64)
             ));
 
-            //if we try to page past where there is valid data, bungie will return
-            //empty response, which we detect retrieve_activities (and returns None)
+            // When we truly exhaust the data, Bungie returns empty response (None) or 0 activities
         }
 
         pb.finish_and_clear();
@@ -827,31 +847,65 @@ impl ApiInterface {
         &self,
         instance_id: i64,
     ) -> Result<Option<DestinyPostGameCarnageReportData>, Error> {
-        //TODO: do we need to use baseurls?
         let url = format!(
             "{base}/Platform/Destiny2/Stats/PostGameCarnageReport/{instance_id}/",
             base = PGCR_BASE_URL,
             instance_id = instance_id,
         );
 
-        let response: PGCRResponse =
-            self.client.call_and_parse::<PGCRResponse>(&url).await?;
+        // Retry logic with exponential backoff for transient failures
+        const MAX_RETRIES: u32 = 3;
+        const BASE_DELAY_MS: u64 = 100;
 
-        let data: DestinyPostGameCarnageReportData = match response.response {
-            Some(e) => e,
-            None => {
-                if response.status.error_code == API_RESPONSE_STATUS_SUCCESS {
-                    return Ok(None);
-                } else {
-                    return Err(Error::ApiRequest {
-                        description: String::from(
-                            "No response data from API Call.",
-                        ),
-                    });
+        let mut last_error: Option<Error> = None;
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                // Exponential backoff: 100ms, 200ms, 400ms
+                let delay = BASE_DELAY_MS * (1 << attempt);
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay))
+                    .await;
+            }
+
+            match self.client.call_and_parse::<PGCRResponse>(&url).await {
+                Ok(response) => {
+                    let data: DestinyPostGameCarnageReportData = match response
+                        .response
+                    {
+                        Some(e) => e,
+                        None => {
+                            if response.status.error_code
+                                == API_RESPONSE_STATUS_SUCCESS
+                            {
+                                return Ok(None);
+                            } else {
+                                // API returned error status - retry
+                                last_error = Some(Error::ApiRequest {
+                                    description: format!(
+                                        "API error code {} for PGCR {}",
+                                        response.status.error_code, instance_id
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    };
+                    return Ok(Some(data));
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    // Network/parse error - retry
+                    continue;
                 }
             }
-        };
+        }
 
-        Ok(Some(data))
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| Error::ApiRequest {
+            description: format!(
+                "Failed to retrieve PGCR {} after {} retries",
+                instance_id, MAX_RETRIES
+            ),
+        }))
     }
 }

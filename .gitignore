@@ -10,3 +10,7 @@ target/
 .DS_Store
 
 notes.md
+
+# Environment variables
+.env
+src/.env
