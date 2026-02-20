@@ -47,6 +47,13 @@ This directory contains the implementation of the dcli library declared in @/dcl
 - PGCR_REQUEST_CHUNK_AMOUNT = 25 (reduced from 100) controls concurrent API requests per batch. Lower values avoid Bungie API rate limiting.
 - `retrieve_post_game_carnage_report()` includes retry logic with exponential backoff (3 retries, 100ms/200ms/400ms delays) to handle transient API failures.
 
+**Scoreboard Data Persistence** (activitystoreinterface.rs):
+- `scoreboard_result` junction table stores scoreboardValues from Bungie PGCRs (scoreboard scores, reward scores, multipliers) linked to `character_activity_stats` via foreign key.
+- Table created via **lazy migration** in `init_with_path()`: checks `sqlite_master` for existence and creates if missing, avoiding a schema version bump (which would drop all tables and require full re-sync).
+- New activities: scoreboardValues inserted inline during `_insert_character_activity_stats()` alongside existing medal_result and weapon_result bulk inserts.
+- `backfill_scoreboard_values<F>()`: re-fetches PGCRs for activities since `SCOREBOARD_VALUES_START_DATE` (2025-08-19) that have no scoreboard_result rows. Processes in PGCR_REQUEST_CHUNK_AMOUNT-sized concurrent batches. Uses `INSERT OR IGNORE` to handle duplicates safely. Idempotent -- becomes a no-op when all activities are caught up.
+- Scoreboard data sourced from `extended.scoreboard_values` on the PGCR response (`HashMap<String, DestinyHistoricalStatsValue>` in @/dcli/src/dcli/src/response/pgcr.rs).
+
 **activitystoreinterface.rs Critical Logic**:
 - `fix_pgcr_data()`: Transforms incorrect Competitive mode IDs when `director_activity_hash` matches known competitive values. Essential for Season 25+ data accuracy.
 - Database operations use sqlx with SQLite, all async.

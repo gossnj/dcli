@@ -590,6 +590,81 @@ pub extern "C" fn dcli_store_sync_player_with_progress(
     }
 }
 
+/// Backfills scoreboard_result data for activities since Aug 2025
+/// that are missing it. Idempotent — returns early if nothing to backfill.
+/// Returns true on success, false on error
+#[no_mangle]
+pub extern "C" fn dcli_store_backfill_scoreboard_values(
+    store: *mut DcliActivityStore,
+) -> bool {
+    dcli_store_backfill_scoreboard_values_with_progress(
+        store,
+        None,
+        std::ptr::null_mut(),
+    )
+}
+
+/// Backfills scoreboard_result data with progress callback
+/// Returns true on success, false on error
+#[no_mangle]
+pub extern "C" fn dcli_store_backfill_scoreboard_values_with_progress(
+    store: *mut DcliActivityStore,
+    callback: Option<ProgressCallback>,
+    user_data: *mut std::ffi::c_void,
+) -> bool {
+    if store.is_null() {
+        return false;
+    }
+
+    let send_progress = move |progress: SyncProgress| {
+        if let Some(cb) = callback {
+            let message = match &progress {
+                SyncProgress::DownloadingActivities { current, total } => {
+                    format!(
+                        "Backfilling scoreboard data ({}/{})",
+                        current, total
+                    )
+                }
+                SyncProgress::Complete { total_synced } => {
+                    format!(
+                        "Scoreboard backfill complete! {} activities processed",
+                        total_synced
+                    )
+                }
+                _ => return,
+            };
+
+            let (_, current, total) = progress.to_progress_tuple();
+
+            if let Ok(c_msg) = CString::new(message) {
+                cb(c_msg.as_ptr(), current, total, user_data);
+            }
+        }
+    };
+
+    unsafe {
+        let store_ptr = store as *mut DcliActivityStore;
+        let runtime = &mut (*store_ptr).runtime;
+        let store_ref = &mut (*store_ptr).store;
+
+        runtime.block_on(async {
+            match store_ref.backfill_scoreboard_values(send_progress).await {
+                Ok(result) => {
+                    info!(
+                        "Scoreboard backfill: {}/{} activities processed",
+                        result.total_synced, result.total_available
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!("Scoreboard backfill failed: {:?}", e);
+                    false
+                }
+            }
+        })
+    }
+}
+
 /// Gets Crucible stats from the local database for a character
 /// Uses the `all_time` time period
 /// Returns true on success, false on error

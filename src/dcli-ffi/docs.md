@@ -28,23 +28,25 @@ This module bridges Rust dcli functionality to the Swift application at @/Last B
 - `DcliCharacter` (`#[repr(C)]`): id (i64), class_type (i32), minutes_played_total (i64)
 - `DcliManifestInfo` (`#[repr(C)]`): version and URL pointers with lengths
 
-**API Client Functions** (lines 73-261):
+**API Client Functions**:
 - `dcli_client_new(api_key: *const c_char) -> *mut DcliApiClient`: Creates API client
 - `dcli_client_free(client: *mut DcliApiClient)`: Destroys client
 - `dcli_search_player(client, bungie_name, out_member_id, out_platform) -> bool`: Player search
 - `dcli_get_crucible_stats(client, member_id, character_id, platform, mode, out_stats) -> bool`: Fetch stats from API
 - `dcli_get_characters(client, member_id, platform, out_characters, max_characters) -> i32`: Retrieve character list
 
-**Activity Store Functions** (lines 263-617):
+**Activity Store Functions**:
 - `dcli_store_init(data_dir: *const c_char) -> *mut DcliActivityStore`: Initialize store with path
 - `dcli_store_free(store: *mut DcliActivityStore)`: Destroy store
 - `dcli_store_add_player(store, bungie_name) -> bool`: Add player to sync list
 - `dcli_store_remove_player(store, bungie_name) -> bool`: Remove player from sync list
 - `dcli_store_sync_player(store, bungie_name) -> bool`: Sync activities from API
 - `dcli_store_sync_player_with_progress(store, bungie_name, callback, user_data) -> bool`: Sync with progress callbacks
+- `dcli_store_backfill_scoreboard_values(store) -> bool`: Backfill scoreboard data for post-Aug-2025 activities missing it. Idempotent.
+- `dcli_store_backfill_scoreboard_values_with_progress(store, callback, user_data) -> bool`: Same with progress callback
 - `dcli_store_get_crucible_stats(store, bungie_name, character_class, mode, out_stats) -> bool`: Query local database for stats
 
-**Manifest Management Functions** (lines 619-864):
+**Manifest Management Functions**:
 - `dcli_manifest_needs_update(data_dir, out_needs_update) -> bool`: Check if manifest needs update
 - `dcli_manifest_download(data_dir, api_key) -> bool`: Download and install manifest from Bungie
 
@@ -64,11 +66,11 @@ This module bridges Rust dcli functionality to the Swift application at @/Last B
 
 **String Conversions**: Swift passes UTF-8 C strings (`*const c_char`). Rust converts via `CStr::from_ptr()` and validates `.to_str()`. Output strings allocated via `CString::new()` must be freed by caller via `dcli_string_free()`.
 
-**Stats Calculation** in `dcli_store_get_crucible_stats()` (lines 521-606): Queries database for all-time stats (past 10 years using `DateTimePeriod`), converts `PlayerActivitiesSummary` to `DcliCrucibleStats`. Some fields like `average_kill_distance` and `suicides` unavailable in summary, set to 0.
+**Stats Calculation** in `dcli_store_get_crucible_stats()`: Queries database for all-time stats (past 10 years using `DateTimePeriod`), converts `PlayerActivitiesSummary` to `DcliCrucibleStats`. Some fields like `average_kill_distance` and `suicides` unavailable in summary, set to 0.
 
 **Platform Encoding**: Platform IDs passed as i32, converted via `Platform::from_id()`. Mode IDs passed as i32, validated via `Mode::from_id()` which returns Result.
 
-**Character Class Selection** (lines 513-519): Maps integer to enum - 0=Titan, 1=Hunter, 2=Warlock, 3=LastActive, _=All.
+**Character Class Selection**: Maps integer to enum - 0=Titan, 1=Hunter, 2=Warlock, 3=LastActive, _=All.
 
 **No Concurrent Access Safety**: FFI handles not thread-safe. Swift must ensure exclusive access or provide its own synchronization.
 

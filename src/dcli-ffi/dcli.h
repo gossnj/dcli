@@ -125,6 +125,13 @@ bool dcli_store_remove_player(struct DcliActivityStore *store, const char *bungi
 bool dcli_store_sync_player(struct DcliActivityStore *store, const char *bungie_name);
 
 /**
+ * Backfills scoreboard_result data for activities since Aug 2025
+ * that are missing it. Idempotent — returns early if nothing to backfill.
+ * Returns true on success, false on error
+ */
+bool dcli_store_backfill_scoreboard_values(struct DcliActivityStore *store);
+
+/**
  * Gets Crucible stats from the local database for a character
  * Uses the `all_time` time period
  * Returns true on success, false on error

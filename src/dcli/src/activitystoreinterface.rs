@@ -88,6 +88,28 @@ const PGCR_REQUEST_CHUNK_AMOUNT: usize = 25;
 const DB_SCHEMA_VERSION: i32 = 10;
 const NO_TEAMS_INDEX: i32 = 253;
 
+const SCOREBOARD_RESULT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS "main"."scoreboard_result" (
+    "id"                        INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT UNIQUE,
+    "reference_id"              TEXT NOT NULL,
+    "value"                     REAL NOT NULL,
+    "character_activity_stats"  INTEGER NOT NULL,
+
+    UNIQUE("character_activity_stats", "reference_id"),
+
+    FOREIGN KEY ("character_activity_stats")
+        REFERENCES "character_activity_stats" ("id")
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_scoreboard_result_cas ON scoreboard_result(character_activity_stats);
+"#;
+
+// Sentinel key inserted when a PGCR has no scoreboard data, to avoid re-fetching
+const SCOREBOARD_SENTINEL_KEY: &str = "__no_scoreboard__";
+
+// Date when Bungie added scoreboardValues to PGCRs
+const SCOREBOARD_VALUES_START_DATE: &str = "2025-08-19T00:00:00Z";
+
 pub struct ActivityStoreInterface {
     db: SqliteConnection,
     path: String,
@@ -151,6 +173,22 @@ impl ActivityStoreInterface {
         if should_update_schema {
             tell::update!("Data store needs to be updated.");
             sqlx::query(STORE_DB_SCHEMA).execute(&mut db).await?;
+        }
+
+        // Lazy migration: ensure scoreboard_result table exists
+        // This avoids a schema version bump (and full re-sync) for adding a new table
+        let has_scoreboard_table = sqlx::query(
+            r#"SELECT name FROM sqlite_master WHERE type='table' AND name='scoreboard_result'"#,
+        )
+        .fetch_optional(&mut db)
+        .await?
+        .is_some();
+
+        if !has_scoreboard_table {
+            tell::update!("Adding scoreboard_result table.");
+            sqlx::query(SCOREBOARD_RESULT_SCHEMA)
+                .execute(&mut db)
+                .await?;
         }
 
         let api_interface = match key {
@@ -632,6 +670,191 @@ impl ActivityStoreInterface {
         Ok(SyncResult {
             total_synced,
             total_available: total_in_queue,
+        })
+    }
+
+    /// Backfills scoreboard_result data for activities since Aug 2025 that are
+    /// missing it. Re-fetches PGCRs and extracts scoreboardValues.
+    /// Idempotent — returns early if nothing to backfill.
+    /// Inserts sentinel rows for activities with no scoreboard data to avoid
+    /// re-fetching them on subsequent runs.
+    pub async fn backfill_scoreboard_values<F>(
+        &mut self,
+        on_progress: F,
+    ) -> Result<SyncResult, Error>
+    where
+        F: Fn(SyncProgress),
+    {
+        // Find activity_ids that are post-scoreboardValues but have no data
+        let mut ids: Vec<i64> = Vec::new();
+        {
+            let mut rows = sqlx::query(
+                r#"
+                SELECT DISTINCT a.activity_id
+                FROM activity a
+                INNER JOIN character_activity_stats cas ON cas.activity = a.activity_id
+                WHERE a.period >= ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM scoreboard_result sr
+                    WHERE sr.character_activity_stats = cas.id
+                )
+                ORDER BY a.activity_id DESC
+                "#,
+            )
+            .bind(SCOREBOARD_VALUES_START_DATE)
+            .fetch(&mut self.db);
+
+            while let Some(row) = rows.try_next().await? {
+                let activity_id: i64 = row.try_get("activity_id")?;
+                ids.push(activity_id);
+            }
+        }
+
+        if ids.is_empty() {
+            info!("Scoreboard backfill: nothing to backfill");
+            return Ok(SyncResult {
+                total_available: 0,
+                total_synced: 0,
+            });
+        }
+
+        let total_available = ids.len() as u32;
+        let mut total_synced: u32 = 0;
+
+        info!(
+            "Scoreboard backfill: {} activities to process",
+            total_available
+        );
+
+        on_progress(SyncProgress::DownloadingActivities {
+            current: 0,
+            total: total_available,
+        });
+
+        for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
+            let mut futures = Vec::new();
+            for c in id_chunks {
+                futures.push(
+                    self.api_interface.retrieve_post_game_carnage_report(*c),
+                );
+            }
+
+            let results = futures::future::join_all(futures).await;
+
+            self.begin_transaction().await?;
+
+            let batch_result: Result<(), Error> = async {
+                for r in results {
+                    match r {
+                        Ok(Some(pgcr)) => {
+                            let activity_id =
+                                pgcr.activity_details.instance_id;
+                            let mut had_scoreboard_data = false;
+
+                            for entry in &pgcr.entries {
+                                // Look up the character_activity_stats id
+                                let cas_row = sqlx::query(
+                                    r#"SELECT "id" FROM "character_activity_stats" WHERE activity = ? AND character = ?"#,
+                                )
+                                .bind(activity_id)
+                                .bind(entry.character_id)
+                                .fetch_optional(&mut self.db)
+                                .await?;
+
+                                let cas_id = match cas_row {
+                                    Some(row) => row.try_get::<i32, _>("id")?,
+                                    None => continue,
+                                };
+
+                                if let Some(extended) = &entry.extended {
+                                    if let Some(scoreboard) =
+                                        &extended.scoreboard_values
+                                    {
+                                        if !scoreboard.is_empty() {
+                                            had_scoreboard_data = true;
+
+                                            let mut query_builder: QueryBuilder<Sqlite> =
+                                                QueryBuilder::new(
+                                                    r#"INSERT OR IGNORE INTO "main"."scoreboard_result" ("reference_id", "value", "character_activity_stats") "#,
+                                                );
+
+                                            query_builder.push_values(
+                                                scoreboard.iter(),
+                                                |mut b, (key, value)| {
+                                                    b.push_bind(key.clone())
+                                                        .push_bind(
+                                                            value.basic.value,
+                                                        )
+                                                        .push_bind(cas_id);
+                                                },
+                                            );
+
+                                            query_builder
+                                                .build()
+                                                .execute(&mut self.db)
+                                                .await?;
+
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                // No scoreboard data for this entry — insert sentinel
+                                // so we don't re-fetch this PGCR on the next run
+                                if !had_scoreboard_data {
+                                    sqlx::query(
+                                        r#"INSERT OR IGNORE INTO "main"."scoreboard_result" ("reference_id", "value", "character_activity_stats") VALUES (?, 0, ?)"#,
+                                    )
+                                    .bind(SCOREBOARD_SENTINEL_KEY)
+                                    .bind(cas_id)
+                                    .execute(&mut self.db)
+                                    .await?;
+                                }
+                            }
+
+                            total_synced += 1;
+                        }
+                        Ok(None) => {
+                            tell::error!(
+                                "Scoreboard backfill: PGCR returned empty response"
+                            );
+                        }
+                        Err(e) => {
+                            tell::error!(
+                                "Scoreboard backfill: error fetching PGCR: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            match batch_result {
+                Ok(()) => self.commit_transaction().await?,
+                Err(e) => {
+                    let _ = self.rollback_transaction().await;
+                    return Err(e);
+                }
+            }
+
+            on_progress(SyncProgress::DownloadingActivities {
+                current: total_synced,
+                total: total_available,
+            });
+        }
+
+        info!(
+            "Scoreboard backfill complete: {}/{} activities processed",
+            total_synced, total_available
+        );
+
+        on_progress(SyncProgress::Complete { total_synced });
+
+        Ok(SyncResult {
+            total_available,
+            total_synced,
         })
     }
 
@@ -1739,6 +1962,29 @@ impl ActivityStoreInterface {
                             ))
                             .push_bind(character_activity_stats_id);
                     });
+
+                    query_builder.build().execute(&mut self.db).await?;
+                }
+            }
+        }
+
+        // Bulk insert scoreboard values using QueryBuilder
+        if let Some(extended) = &char_data.extended {
+            if let Some(scoreboard) = &extended.scoreboard_values {
+                if !scoreboard.is_empty() {
+                    let mut query_builder: QueryBuilder<Sqlite> =
+                        QueryBuilder::new(
+                            r#"INSERT INTO "main"."scoreboard_result" ("reference_id", "value", "character_activity_stats") "#,
+                        );
+
+                    query_builder.push_values(
+                        scoreboard.iter(),
+                        |mut b, (key, value)| {
+                            b.push_bind(key.clone())
+                                .push_bind(value.basic.value)
+                                .push_bind(character_activity_stats_id);
+                        },
+                    );
 
                     query_builder.build().execute(&mut self.db).await?;
                 }

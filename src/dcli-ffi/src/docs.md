@@ -15,11 +15,12 @@ This is the implementation layer called by mobile apps through C interop. The so
 **Single File Architecture** (@/dcli/src/dcli-ffi/src/lib.rs): ~988 lines in one file, organized by functional area with MARK comments.
 
 **Sections**:
-1. **Platform Logging** (lines 36-78): Conditional compilation for iOS (OSLog), Android (android_logger), or no-op. Filters sqlx query spam to Warn level.
+1. **Platform Logging**: Conditional compilation for iOS (OSLog), Android (android_logger), or no-op. Filters sqlx query spam to Warn level.
 2. **API Client Functions**: Player search and stats retrieval from Bungie API
 3. **Activity Store Functions**: Database operations for syncing and querying activities
-4. **Manifest Management**: Manifest download and update checking with 2-minute timeout
-5. **Utility Functions**: String memory management and error retrieval
+4. **Scoreboard Backfill Functions**: `dcli_store_backfill_scoreboard_values()` and `dcli_store_backfill_scoreboard_values_with_progress()` re-fetch PGCRs to populate scoreboard data for activities since Aug 2025 that were synced before scoreboardValues storage was implemented. Delegates to `ActivityStoreInterface::backfill_scoreboard_values()`. The no-progress variant delegates to the with-progress variant with a null callback.
+5. **Manifest Management**: Manifest download and update checking with 2-minute timeout
+6. **Utility Functions**: String memory management and error retrieval
 
 **Memory Management Pattern**:
 ```rust
