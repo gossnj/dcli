@@ -24,13 +24,15 @@ This library is the central dependency for all dcli workspace members. CLI tools
 - **response/**: Serde-deserializable structs matching Bungie API JSON responses (PGCR, activities, stats, character data).
 - **utils.rs**: Utility functions for KD ratio calculations, date/time handling, activity hash constants, error formatting.
 
-**Database Schema**: @/dcli/src/dcli/actitvity_store_schema.sql defines tables: `member`, `character`, `activity`, `character_activity_stats`, `weapon_result`, `medal_result`, `modes`, `team_result`, `activity_queue`, `sync`.
+**Database Schema**: @/dcli/src/dcli/actitvity_store_schema.sql defines the activity, character, statistics, result, queue, and sync tables. `ActivityStoreInterface::init_with_path()` also installs an idempotent partial index on pending queue rows, ordered by character and descending activity ID, and an index on `team_result(activity)` for activity-scoped team lookups. It does so for both fresh and existing stores while leaving schema version 10 unchanged; version mismatch still invokes the existing schema rebuild path.
 
 **Data Flow**:
 1. API requests via ApiInterface → ApiClient → Bungie servers
 2. Responses deserialized into response structs
 3. ActivityStoreInterface transforms and persists to SQLite
 4. Queries aggregate data from SQLite for statistics
+
+During sync, pending activity IDs are selected by character with newest IDs first. PGCR results are inserted in a batch transaction, with a savepoint around each report. A report-level write failure rolls back that report's writes and leaves its queue entry pending for retry while successful sibling reports can commit. Batch control or commit failures roll back the transaction and return an error; rollback failures include the original error context.
 
 ### Things to Know
 
@@ -46,6 +48,8 @@ This library is the central dependency for all dcli workspace members. CLI tools
 **DCLI_FIX_DATA Environment Variable**: When set to `TRUE`, attempts to re-fetch corrupt data from Bungie API. Significantly slows initial sync but improves data quality for applications building datastores.
 
 **Database Schema Version**: Current version is 10 (DB_SCHEMA_VERSION constant). Schema upgrades handled in activitystoreinterface.rs.
+
+**Additive Index Initialization**: The pending queue and team-result indexes are ensured after any schema initialization on every store open. An index creation failure surfaces as an initialization error without rebuilding the database, so opening the store can be retried after the cause is removed. This batch behavior does not repair partial activity rows created before the savepoint handling existed; an existing activity row remains the completion check used by sync.
 
 **Manifest Hash Conversion**: Bungie API uses unsigned 32-bit hashes; manifest database uses signed 64-bit IDs. Conversion function in manifestinterface.rs:44-52.
 
