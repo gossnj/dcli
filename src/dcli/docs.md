@@ -24,7 +24,7 @@ This library is the central dependency for all dcli workspace members. CLI tools
 - **response/**: Serde-deserializable structs matching Bungie API JSON responses (PGCR, activities, stats, character data).
 - **utils.rs**: Utility functions for KD ratio calculations, date/time handling, activity hash constants, error formatting.
 
-**Database Schema**: @/dcli/src/dcli/actitvity_store_schema.sql defines tables: `member`, `character`, `activity`, `character_activity_stats`, `weapon_result`, `medal_result`, `modes`, `team_result`, `activity_queue`, `sync`.
+**Database Schema**: @/dcli/src/dcli/actitvity_store_schema.sql defines the activity store tables and the indexes used for activity and result lookups. On every open, `ActivityStoreInterface::init_with_path()` also ensures the pending-queue and team-result indexes exist, so existing version-10 databases receive these indexes without rebuilding their stored activity history. The scoreboard table remains a separate lazy migration.
 
 **Data Flow**:
 1. API requests via ApiInterface → ApiClient → Bungie servers
@@ -46,6 +46,10 @@ This library is the central dependency for all dcli workspace members. CLI tools
 **DCLI_FIX_DATA Environment Variable**: When set to `TRUE`, attempts to re-fetch corrupt data from Bungie API. Significantly slows initial sync but improves data quality for applications building datastores.
 
 **Database Schema Version**: Current version is 10 (DB_SCHEMA_VERSION constant). Schema upgrades handled in activitystoreinterface.rs.
+
+**Activity Batch Writes**: `insert_activities_batch()` uses one outer SQLite transaction for the batch and a savepoint for each report. A report whose insert fails is rolled back to its savepoint and remains eligible for a later sync retry, while later reports continue. Errors setting up or releasing a savepoint, or committing the batch, trigger rollback of the outer transaction and are returned to the caller; a successful batch reports the count of inserted activities.
+
+**Store Indexes**: The store schema and `init_with_path()` install `activity_queue_pending_character_index` for unsynced queue entries by character and descending activity ID, and `team_result_activity_index` for activity-based team-result lookups. Installation uses `IF NOT EXISTS`, and initialization surfaces SQLite errors from index creation.
 
 **Manifest Hash Conversion**: Bungie API uses unsigned 32-bit hashes; manifest database uses signed 64-bit IDs. Conversion function in manifestinterface.rs:44-52.
 

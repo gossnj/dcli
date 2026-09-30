@@ -43,7 +43,7 @@ This directory contains the implementation of the dcli library declared in @/dcl
 - `SyncProgress` enum provides granular progress phases: `Starting`, `FetchingHistory`, `DownloadingActivities`, `SavingActivities`, `Complete`, `Failed`. Used by FFI layer for mobile app progress UI.
 - `sync_player_with_progress<F>()` accepts a progress callback invoked at each sync phase. Wraps `sync_member_with_progress()` which iterates characters.
 - Activity queue queries use `ORDER BY activity_id DESC` to prioritize recent games - ensures users see newest activities first if sync is interrupted.
-- `insert_activities_batch()` wraps multiple activity inserts in a single SQLite transaction for performance. Individual insert failures are logged but don't abort the batch.
+- `insert_activities_batch()` wraps the batch in an outer SQLite transaction and each report insert in a savepoint. An insert failure rolls that report back, logs it, and allows the remaining reports to continue; the failed report remains queued for a later sync. Savepoint-control or batch-commit failures roll back the outer transaction and return an error.
 - PGCR_REQUEST_CHUNK_AMOUNT = 25 (reduced from 100) controls concurrent API requests per batch. Lower values avoid Bungie API rate limiting.
 - `retrieve_post_game_carnage_report()` includes retry logic with exponential backoff (3 retries, 100ms/200ms/400ms delays) to handle transient API failures.
 
@@ -58,6 +58,10 @@ This directory contains the implementation of the dcli library declared in @/dcl
 - `fix_pgcr_data()`: Transforms incorrect Competitive mode IDs when `director_activity_hash` matches known competitive values. Essential for Season 25+ data accuracy.
 - Database operations use sqlx with SQLite, all async.
 - Progress reporting via indicatif ProgressBar for CLI, callback-based for FFI.
+
+**Database Initialization and Indexes** (`activitystoreinterface.rs`, `actitvity_store_schema.sql`): `init_with_path()` applies the schema when the stored version is not current, then ensures the scoreboard table and two lookup indexes exist. Scoreboard creation remains a lazy migration to avoid a version bump and full history rebuild. `activity_queue_pending_character_index` covers unsynced queue rows by character and descending activity ID; `team_result_activity_index` covers result rows by activity. `IF NOT EXISTS` makes index setup repeatable for fresh and existing stores, and SQLite setup errors are returned from initialization.
+
+**Activity Write Boundary** (`activitystoreinterface.rs`): A batch has one outer transaction and one savepoint per report. Failures within a report roll back all rows written for that report, including its parent and child rows, while subsequent reports may commit. Errors during savepoint control or transaction commit roll the batch back and propagate to the caller. Because queue completion is part of the report write, a rolled-back report remains available for retry.
 
 **Mode Enum** (enums/mode.rs): Contains 70+ mode variants covering all Crucible game types. Includes methods `is_crucible()`, `is_private()`, `from_id()`, `as_id()`. Modes can be compound (e.g., `AllPvP`, `AllPvPQuickplay`).
 
