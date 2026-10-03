@@ -60,6 +60,7 @@ use crate::enums::character::{CharacterClass, CharacterClassSelection};
 use crate::enums::medaltier::MedalTier;
 use crate::enums::mode::Mode;
 use crate::enums::platform::Platform;
+use crate::initializationdiagnostics::InitializationDiagnostics;
 use crate::{apiinterface::ApiInterface, manifestinterface::ManifestInterface};
 use crate::{
     error::Error,
@@ -75,6 +76,7 @@ use crate::{
 use std::env;
 
 use log::info;
+use std::time::Instant;
 
 const STORE_FILE_NAME: &str = "dcli.sqlite3";
 const STORE_DB_SCHEMA: &str = include_str!("../actitvity_store_schema.sql");
@@ -129,6 +131,14 @@ impl ActivityStoreInterface {
         store_dir: &Path,
         key: Option<String>,
     ) -> Result<ActivityStoreInterface, Error> {
+        Self::init_with_path_recording(store_dir, key, None).await
+    }
+
+    pub async fn init_with_path_recording(
+        store_dir: &Path,
+        key: Option<String>,
+        mut diagnostics: Option<&mut InitializationDiagnostics>,
+    ) -> Result<ActivityStoreInterface, Error> {
         let path = store_dir.join(STORE_FILE_NAME).display().to_string();
 
         let fix_corrupt_data = match env::var(DCLI_FIX_DATA) {
@@ -150,67 +160,160 @@ impl ActivityStoreInterface {
         let connection_string: &str = &path;
 
         //TODO: Is this still the correct / best journal mode for us?
-        let mut db = SqliteConnectOptions::from_str(connection_string)?
+        let started = Instant::now();
+        let options = SqliteConnectOptions::from_str(connection_string);
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record_sqlx(
+                "activity",
+                "connect_options",
+                started,
+                &options,
+            );
+        }
+        let started = Instant::now();
+        let opened = options?
             .journal_mode(SqliteJournalMode::Wal)
             .create_if_missing(true)
             .read_only(read_only)
             .connect()
-            .await?;
+            .await;
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record_sqlx("activity", "open", started, &opened);
+        }
+        let mut db = opened?;
 
         //is this an existing db, or a completely new one / first time?
-        let should_update_schema = match sqlx::query(
+        let started = Instant::now();
+        let schema_read = sqlx::query(
             r#"
             SELECT max(version) as max_version FROM version
         "#,
         )
         .fetch_one(&mut db)
-        .await
-        {
+        .await;
+        let should_update_schema = match schema_read {
             Ok(e) => {
-                let version: i32 = e.try_get("max_version").unwrap_or(-1);
+                let decoded: Result<i32, sqlx::Error> =
+                    e.try_get("max_version");
+                if let Some(report) = diagnostics.as_deref_mut() {
+                    report.record_sqlx(
+                        "activity",
+                        "schema_read",
+                        started,
+                        &decoded,
+                    );
+                }
+                let version = decoded.unwrap_or(-1);
+                if let Some(report) = diagnostics.as_deref_mut() {
+                    report.schema_version_before = Some(version);
+                }
                 version != DB_SCHEMA_VERSION
             }
-            Err(_e) => true,
+            Err(error) => {
+                if let Some(report) = diagnostics.as_deref_mut() {
+                    report.record_sqlx::<()>(
+                        "activity",
+                        "schema_read",
+                        started,
+                        &Err(error),
+                    );
+                }
+                true
+            }
         };
 
         if should_update_schema {
             tell::update!("Data store needs to be updated.");
-            sqlx::query(STORE_DB_SCHEMA).execute(&mut db).await?;
+            let started = Instant::now();
+            let applied = sqlx::query(STORE_DB_SCHEMA).execute(&mut db).await;
+            if let Some(report) = diagnostics.as_deref_mut() {
+                report.record_sqlx(
+                    "activity",
+                    "schema_apply",
+                    started,
+                    &applied,
+                );
+            }
+            applied?;
         }
 
         // Lazy migration: ensure scoreboard_result table exists
         // This avoids a schema version bump (and full re-sync) for adding a new table
-        let has_scoreboard_table = sqlx::query(
+        let started = Instant::now();
+        let scoreboard_check = sqlx::query(
             r#"SELECT name FROM sqlite_master WHERE type='table' AND name='scoreboard_result'"#,
         )
         .fetch_optional(&mut db)
-        .await?
-        .is_some();
+        .await;
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record_sqlx(
+                "activity",
+                "scoreboard_check",
+                started,
+                &scoreboard_check,
+            );
+        }
+        let has_scoreboard_table = scoreboard_check?.is_some();
 
         if !has_scoreboard_table {
             tell::update!("Adding scoreboard_result table.");
-            sqlx::query(SCOREBOARD_RESULT_SCHEMA)
-                .execute(&mut db)
-                .await?;
+            let started = Instant::now();
+            let scoreboard_created =
+                sqlx::query(SCOREBOARD_RESULT_SCHEMA).execute(&mut db).await;
+            if let Some(report) = diagnostics.as_deref_mut() {
+                report.record_sqlx(
+                    "activity",
+                    "scoreboard_create",
+                    started,
+                    &scoreboard_created,
+                );
+            }
+            scoreboard_created?;
         }
 
-        sqlx::query(
+        let started = Instant::now();
+        let pending_index = sqlx::query(
             "CREATE INDEX IF NOT EXISTS activity_queue_pending_character_index \
              ON activity_queue(character, activity_id DESC) WHERE synced = 0",
         )
         .execute(&mut db)
-        .await?;
-        sqlx::query(
+        .await;
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record_sqlx(
+                "activity",
+                "pending_index",
+                started,
+                &pending_index,
+            );
+        }
+        pending_index?;
+        let started = Instant::now();
+        let team_index = sqlx::query(
             "CREATE INDEX IF NOT EXISTS team_result_activity_index \
              ON team_result(activity)",
         )
         .execute(&mut db)
-        .await?;
+        .await;
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record_sqlx("activity", "team_index", started, &team_index);
+        }
+        team_index?;
 
+        let started = Instant::now();
         let api_interface = match key {
-            Some(e) => ApiInterface::new_with_key(&e)?,
-            None => ApiInterface::new()?,
+            Some(e) => ApiInterface::new_with_key(&e),
+            None => ApiInterface::new(),
         };
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record(
+                "activity",
+                "api_client",
+                started,
+                api_interface.as_ref().err().map(|_| "api"),
+                None,
+            );
+        }
+        let api_interface = api_interface?;
 
         Ok(ActivityStoreInterface {
             db,

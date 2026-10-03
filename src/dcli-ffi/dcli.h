@@ -102,6 +102,13 @@ int32_t dcli_get_characters(struct DcliApiClient *client,
 struct DcliActivityStore *dcli_store_init(const char *data_dir);
 
 /**
+ * Initializes a store and returns per-call diagnostic JSON on success or failure.
+ * out_json may be null. Free a non-null *out_json with dcli_string_free.
+ */
+struct DcliActivityStore *dcli_store_init_with_diagnostics(const char *data_dir,
+                                                            char **out_json);
+
+/**
  * Frees a store created with dcli_store_init
  */
 void dcli_store_free(struct DcliActivityStore *store);

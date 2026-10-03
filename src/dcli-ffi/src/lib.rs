@@ -91,10 +91,12 @@ use dcli::enums::character::CharacterClassSelection;
 use dcli::enums::mode::Mode;
 use dcli::enums::moment::DateTimePeriod;
 use dcli::enums::platform::Platform;
+use dcli::initializationdiagnostics::InitializationDiagnostics;
 use dcli::manifestinterface::ManifestInterface;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// Opaque pointer to ApiInterface
 pub struct DcliApiClient {
@@ -358,28 +360,130 @@ pub type ProgressCallback =
 pub extern "C" fn dcli_store_init(
     data_dir: *const c_char,
 ) -> *mut DcliActivityStore {
+    store_init_impl(data_dir, None)
+}
+
+/// Initializes the store and returns per-call diagnostic JSON on success or failure.
+/// out_json may be null. When *out_json is non-null, free it with dcli_string_free.
+#[no_mangle]
+pub extern "C" fn dcli_store_init_with_diagnostics(
+    data_dir: *const c_char,
+    out_json: *mut *mut c_char,
+) -> *mut DcliActivityStore {
+    if !out_json.is_null() {
+        unsafe { *out_json = std::ptr::null_mut() };
+    }
+
+    let mut diagnostics = InitializationDiagnostics::default();
+    let store = store_init_impl(data_dir, Some(&mut diagnostics));
+
+    if !out_json.is_null() {
+        let revision = option_env!("DCLI_BUILD_REVISION")
+            .filter(|value| {
+                value.len() == 40
+                    && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .unwrap_or("unknown");
+        let report = serde_json::json!({
+            "version": 1,
+            "success": !store.is_null(),
+            "source_revision": revision,
+            "schema_version_before": diagnostics.schema_version_before,
+            "events": diagnostics.events,
+        });
+        if let Ok(json) = CString::new(report.to_string()) {
+            unsafe { *out_json = json.into_raw() };
+        }
+    }
+
+    store
+}
+
+fn store_init_impl(
+    data_dir: *const c_char,
+    mut diagnostics: Option<&mut InitializationDiagnostics>,
+) -> *mut DcliActivityStore {
     init_platform_logging();
 
+    let started = Instant::now();
     if data_dir.is_null() {
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record(
+                "runtime",
+                "validate_path",
+                started,
+                Some("invalid_path"),
+                None,
+            );
+        }
         return std::ptr::null_mut();
     }
 
     let dir = unsafe {
         match CStr::from_ptr(data_dir).to_str() {
-            Ok(s) => PathBuf::from(s),
-            Err(_) => return std::ptr::null_mut(),
+            Ok(s) => {
+                if let Some(report) = diagnostics.as_deref_mut() {
+                    report.record(
+                        "runtime",
+                        "validate_path",
+                        started,
+                        None,
+                        None,
+                    );
+                }
+                PathBuf::from(s)
+            }
+            Err(_) => {
+                if let Some(report) = diagnostics.as_deref_mut() {
+                    report.record(
+                        "runtime",
+                        "validate_path",
+                        started,
+                        Some("invalid_path"),
+                        None,
+                    );
+                }
+                return std::ptr::null_mut();
+            }
         }
     };
 
+    let started = Instant::now();
     let runtime = match tokio::runtime::Runtime::new() {
-        Ok(r) => r,
-        Err(_) => return std::ptr::null_mut(),
+        Ok(r) => {
+            if let Some(report) = diagnostics.as_deref_mut() {
+                report.record("runtime", "runtime", started, None, None);
+            }
+            r
+        }
+        Err(_) => {
+            if let Some(report) = diagnostics.as_deref_mut() {
+                report.record(
+                    "runtime",
+                    "runtime",
+                    started,
+                    Some("runtime"),
+                    None,
+                );
+            }
+            return std::ptr::null_mut();
+        }
     };
 
     // Initialize store and manifest
     let result = runtime.block_on(async {
-        let store = ActivityStoreInterface::init_with_path(&dir, None).await;
-        let manifest = ManifestInterface::new(&dir, false).await;
+        let store = ActivityStoreInterface::init_with_path_recording(
+            &dir,
+            None,
+            diagnostics.as_deref_mut(),
+        )
+        .await;
+        let manifest = ManifestInterface::new_recording(
+            &dir,
+            false,
+            diagnostics.as_deref_mut(),
+        )
+        .await;
 
         match (store, manifest) {
             (Ok(s), Ok(m)) => Some((s, m)),
