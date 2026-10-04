@@ -173,4 +173,7 @@ CREATE INDEX idx_character_activity_stats_activity ON character_activity_stats(a
 
 CREATE INDEX idx_character_activity_stats_fireteam_id ON character_activity_stats(fireteam_id);
 
+CREATE INDEX IF NOT EXISTS activity_queue_pending_character_index ON activity_queue(character, activity_id DESC) WHERE synced = 0;
+CREATE INDEX IF NOT EXISTS team_result_activity_index ON team_result(activity);
+
 COMMIT;

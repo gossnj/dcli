@@ -88,6 +88,9 @@ const PGCR_REQUEST_CHUNK_AMOUNT: usize = 100;
 const DB_SCHEMA_VERSION: i32 = 10;
 const NO_TEAMS_INDEX: i32 = 253;
 
+#[cfg(test)]
+mod tests;
+
 pub struct ActivityStoreInterface {
     db: SqliteConnection,
     path: String,
@@ -152,6 +155,19 @@ impl ActivityStoreInterface {
             tell::update!("Data store needs to be updated.");
             sqlx::query(STORE_DB_SCHEMA).execute(&mut db).await?;
         }
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS activity_queue_pending_character_index \
+             ON activity_queue(character, activity_id DESC) WHERE synced = 0",
+        )
+        .execute(&mut db)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS team_result_activity_index \
+             ON team_result(activity)",
+        )
+        .execute(&mut db)
+        .await?;
 
         let api_interface = match key {
             Some(e) => ApiInterface::new_with_key(&e)?,
@@ -1058,26 +1074,68 @@ impl ActivityStoreInterface {
 
         self.begin_transaction().await?;
 
-        let mut success_count: u32 = 0;
-        for activity in activities.iter_mut() {
-            match self._insert_activity(activity, character_id).await {
-                Ok(_) => {
+        let result = async {
+            let mut success_count: u32 = 0;
+            for activity in activities.iter_mut() {
+                sqlx::query("SAVEPOINT activity_insert;")
+                    .execute(&mut self.db)
+                    .await?;
+
+                let inserted = match self
+                    ._insert_activity(activity, character_id)
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        // Undo every write for this report, including shared
+                        // upserts and the queue marker, before continuing.
+                        sqlx::query("ROLLBACK TO SAVEPOINT activity_insert;")
+                            .execute(&mut self.db)
+                            .await
+                            .map_err(|rollback_error| Error::Database {
+                                description: format!(
+                                    "{}; activity savepoint rollback failed: {}",
+                                    e, rollback_error
+                                ),
+                            })?;
+                        tell::error!(
+                            "Error inserting activity {}. Skipping: {}",
+                            activity.activity_details.instance_id,
+                            e
+                        );
+                        false
+                    }
+                };
+
+                sqlx::query("RELEASE SAVEPOINT activity_insert;")
+                    .execute(&mut self.db)
+                    .await?;
+                if inserted {
                     success_count += 1;
                 }
-                Err(e) => {
-                    // Log error but continue with batch - activity stays in queue for retry
-                    tell::error!(
-                        "Error inserting activity {}. Skipping: {}",
-                        activity.activity_details.instance_id,
-                        e
-                    );
-                }
+            }
+
+            self.commit_transaction().await?;
+            Ok::<u32, Error>(success_count)
+        }
+        .await;
+
+        match result {
+            Ok(success_count) => Ok(success_count),
+            Err(e) => {
+                // A failed COMMIT can leave SQLite inside the transaction.
+                // Savepoint-control errors also invalidate the whole batch.
+                self.rollback_transaction().await.map_err(
+                    |rollback_error| Error::Database {
+                        description: format!(
+                            "{}; batch transaction rollback failed: {}",
+                            e, rollback_error
+                        ),
+                    },
+                )?;
+                Err(e)
             }
         }
-
-        self.commit_transaction().await?;
-
-        Ok(success_count)
     }
 
     fn remove_from_modes(

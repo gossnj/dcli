@@ -43,11 +43,15 @@ This directory contains the implementation of the dcli library declared in @/dcl
 - `SyncProgress` enum provides granular progress phases: `Starting`, `FetchingHistory`, `DownloadingActivities`, `SavingActivities`, `Complete`, `Failed`. Used by FFI layer for mobile app progress UI.
 - `sync_player_with_progress<F>()` accepts a progress callback invoked at each sync phase. Wraps `sync_member_with_progress()` which iterates characters.
 - Activity queue queries use `ORDER BY activity_id DESC` to prioritize recent games - ensures users see newest activities first if sync is interrupted.
-- `insert_activities_batch()` wraps multiple activity inserts in a single SQLite transaction for performance. Individual insert failures are logged but don't abort the batch.
-- PGCR_REQUEST_CHUNK_AMOUNT = 100 (increased from 50) controls concurrent API requests per batch.
+- `insert_activities_batch()` wraps a PGCR batch in one SQLite transaction and each report in a savepoint. A failed report rolls back its own activity, related rows, upserts, and queue marker, while successful sibling reports can commit; transaction-control or commit errors roll back the batch and return an error.
+- `PGCR_REQUEST_CHUNK_AMOUNT` controls concurrent API requests per batch.
+- Initialization installs an idempotent partial index for pending queue rows ordered by character and descending activity ID, plus an activity index for team-result lookups. These are installed for fresh and existing databases without changing the schema version, whose mismatch path rebuilds the store.
 
 **activitystoreinterface.rs Critical Logic**:
 - `fix_pgcr_data()`: Transforms incorrect Competitive mode IDs when `director_activity_hash` matches known competitive values. Essential for Season 25+ data accuracy.
+- The pending queue index supports the character-scoped, unsynced activity query used by both sync paths. The team-result index supports the activity-scoped lookup in `populate_activity_data()`.
+- A report whose insertion fails during a batch remains pending because the savepoint restores its queue marker along with the report's database writes. Existing historical partial rows are not repaired; `has_activity()` continues to treat an existing activity row as already stored.
+- Index creation errors are returned from initialization, leaving the existing data available for a later initialization retry.
 - Database operations use sqlx with SQLite, all async.
 - Progress reporting via indicatif ProgressBar for CLI, callback-based for FFI.
 
