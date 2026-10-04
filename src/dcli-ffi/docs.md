@@ -37,7 +37,9 @@ This module bridges Rust dcli functionality to the Swift application at @/Last B
 
 **Activity Store Functions**:
 - `dcli_store_init(data_dir: *const c_char) -> *mut DcliActivityStore`: Initialize store with path
-- `dcli_store_free(store: *mut DcliActivityStore)`: Destroy store
+- `dcli_store_init_with_diagnostics(data_dir, out_json)`: Additive initializer returning a versioned per-call initialization report
+- `dcli_store_close(store) -> bool`: Consume the handle and await both activity and manifest SQLx connection workers; `true` means both closes succeeded. A non-null handle is consumed even when it returns `false` and cannot be reused.
+- `dcli_store_free(store)`: Legacy best-effort handle destruction that does not wait for SQLite workers
 - `dcli_store_add_player(store, bungie_name) -> bool`: Add player to sync list
 - `dcli_store_remove_player(store, bungie_name) -> bool`: Remove player from sync list
 - `dcli_store_sync_player(store, bungie_name) -> bool`: Sync activities from API
@@ -63,6 +65,8 @@ This module bridges Rust dcli functionality to the Swift application at @/Last B
 **Memory Safety**: All pointer parameters validated for null before dereferencing. CString/CStr conversions wrapped in match statements to handle UTF-8 errors. Box::into_raw() and Box::from_raw() manage heap allocation for opaque handles.
 
 **Error Handling**: FFI functions return bool for success/failure or i32 for counts. Rust Result/Option types converted to success booleans. No detailed error propagation to C side (last_error stub exists but unused).
+
+**Store Close Ownership**: Callers needing a completion result use `dcli_store_close()`. It consumes the opaque pointer before awaiting closure of the activity and manifest SQLx connections and reports true only when both close calls succeed. A false result still means ownership was consumed, so the pointer must not be reused or passed to `dcli_store_free()`. `dcli_store_free()` remains the legacy best-effort path and does not await those workers.
 
 **String Conversions**: Swift passes UTF-8 C strings (`*const c_char`). Rust converts via `CStr::from_ptr()` and validates `.to_str()`. Output strings allocated via `CString::new()` must be freed by caller via `dcli_string_free()`.
 

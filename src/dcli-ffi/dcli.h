@@ -97,19 +97,27 @@ int32_t dcli_get_characters(struct DcliApiClient *client,
 /**
  * Creates a new activity store with the given data directory
  * Returns null on error
- * Caller must call dcli_store_free when done
+ * Caller must call dcli_store_close or dcli_store_free when done
  */
 struct DcliActivityStore *dcli_store_init(const char *data_dir);
 
 /**
  * Initializes a store and returns per-call diagnostic JSON on success or failure.
+ * On failure, cleanup_verified is false when SQLite worker closure is uncertain.
  * out_json may be null. Free a non-null *out_json with dcli_string_free.
  */
 struct DcliActivityStore *dcli_store_init_with_diagnostics(const char *data_dir,
                                                             char **out_json);
 
 /**
- * Frees a store created with dcli_store_init
+ * Consumes a store and waits for both SQLite workers to close.
+ * Returns true only if both workers closed successfully. A non-null pointer is
+ * consumed even on false and must never be reused or freed again. Null returns true.
+ */
+bool dcli_store_close(struct DcliActivityStore *store);
+
+/**
+ * Frees a store created with dcli_store_init without waiting for SQLite workers.
  */
 void dcli_store_free(struct DcliActivityStore *store);
 

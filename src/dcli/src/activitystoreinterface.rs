@@ -49,7 +49,9 @@ use crate::{
 use futures::TryStreamExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::Row;
-use sqlx::{ConnectOptions, QueryBuilder, Sqlite, SqliteConnection};
+use sqlx::{
+    ConnectOptions, Connection, QueryBuilder, Sqlite, SqliteConnection,
+};
 
 use crate::crucible::{
     ActivityDetail, CruciblePlayerActivityPerformance,
@@ -123,6 +125,11 @@ pub struct ActivityStoreInterface {
 }
 
 impl ActivityStoreInterface {
+    pub async fn close(self) -> Result<(), Error> {
+        self.db.close().await?;
+        Ok(())
+    }
+
     pub fn get_storage_path(&self) -> String {
         self.path.clone()
     }
@@ -179,9 +186,13 @@ impl ActivityStoreInterface {
             .await;
         if let Some(report) = diagnostics.as_deref_mut() {
             report.record_sqlx("activity", "open", started, &opened);
+            if opened.is_err() {
+                report.cleanup_verified = false;
+            }
         }
         let mut db = opened?;
 
+        let initialized = async {
         //is this an existing db, or a completely new one / first time?
         let started = Instant::now();
         let schema_read = sqlx::query(
@@ -313,7 +324,21 @@ impl ActivityStoreInterface {
                 None,
             );
         }
-        let api_interface = api_interface?;
+        Ok::<_, Error>(api_interface?)
+        }
+        .await;
+
+        let api_interface = match initialized {
+            Ok(api_interface) => api_interface,
+            Err(error) => {
+                if db.close().await.is_err() {
+                    if let Some(report) = diagnostics.as_deref_mut() {
+                        report.cleanup_verified = false;
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         Ok(ActivityStoreInterface {
             db,

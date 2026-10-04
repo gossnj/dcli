@@ -63,6 +63,10 @@ This directory contains the implementation of the dcli library declared in @/dcl
 
 **Initialization Diagnostics** (`initializationdiagnostics.rs`, `activitystoreinterface.rs`): The FFI store initializer can pass a per-call recorder through store setup. It records ordered activity-database and manifest initialization stages with elapsed time and coarse SQLx error categories/codes, including schema read and application, lookup-index setup, API-client construction, and manifest existence checks. The schema version is captured before schema setup when available. These events describe the existing initialization path; the older initializer remains available without diagnostics.
 
+The diagnostic result also includes `cleanup_verified`. Initialization closes an already-acquired activity or manifest connection when its paired setup fails; a failed close marks cleanup unverified. SQLx connect errors are conservatively marked unverified because the error does not confirm whether a worker was acquired or fully closed.
+
+**Connection Close Ownership** (`activitystoreinterface.rs`, `manifestinterface.rs`): Each interface's consuming `close(self)` awaits its owned SQLx connection's close result. The FFI `dcli_store_close()` consumes the combined store handle and reports success only when both activity and manifest workers close successfully. Its legacy `dcli_store_free()` path remains a best-effort drop without a worker-close wait.
+
 **Activity Write Boundary** (`activitystoreinterface.rs`): A batch has one outer transaction and one savepoint per report. Failures within a report roll back all rows written for that report, including its parent and child rows, while subsequent reports may commit. Errors during savepoint control or transaction commit roll the batch back and propagate to the caller. Because queue completion is part of the report write, a rolled-back report remains available for retry.
 
 **Mode Enum** (enums/mode.rs): Contains 70+ mode variants covering all Crucible game types. Includes methods `is_crucible()`, `is_private()`, `from_id()`, `as_id()`. Modes can be compound (e.g., `AllPvP`, `AllPvPQuickplay`).
