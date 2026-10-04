@@ -43,6 +43,8 @@ This library is the central dependency for all dcli workspace members. CLI tools
 
 **Async Runtime**: All API and database operations are async using tokio. CLI tools create tokio runtimes; FFI layer creates its own runtime per operation.
 
+**SQLite Connection Ownership**: `ActivityStoreInterface::close(self)` and `ManifestInterface::close(self)` consume their connection owners and await SQLx worker closure, returning the close result. The FFI layer's `dcli_store_close()` awaits both close calls and reports whether both succeeded; its legacy `dcli_store_free()` only drops the handle without waiting. During paired store/manifest initialization, the FFI setup closes a connection that succeeded when the other side fails, and records whether that cleanup was verified.
+
 **DCLI_FIX_DATA Environment Variable**: When set to `TRUE`, attempts to re-fetch corrupt data from Bungie API. Significantly slows initial sync but improves data quality for applications building datastores.
 
 **Database Schema Version**: Current version is 10 (DB_SCHEMA_VERSION constant). Schema upgrades handled in activitystoreinterface.rs.

@@ -127,6 +127,9 @@ impl ManifestInterface {
             .await;
         if let Some(report) = diagnostics.as_deref_mut() {
             report.record_sqlx("manifest", "open", started, &opened);
+            if opened.is_err() {
+                report.cleanup_verified = false;
+            }
         }
         let db = opened?;
 

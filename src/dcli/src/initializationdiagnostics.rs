@@ -12,10 +12,20 @@ pub struct InitializationEvent {
     pub sqlite_code: Option<i32>,
 }
 
-#[derive(Default)]
 pub struct InitializationDiagnostics {
     pub schema_version_before: Option<i32>,
     pub events: Vec<InitializationEvent>,
+    pub cleanup_verified: bool,
+}
+
+impl Default for InitializationDiagnostics {
+    fn default() -> Self {
+        Self {
+            schema_version_before: None,
+            events: Vec::new(),
+            cleanup_verified: true,
+        }
+    }
 }
 
 impl InitializationDiagnostics {

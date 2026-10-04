@@ -355,7 +355,7 @@ pub type ProgressCallback =
 
 /// Creates a new activity store with the given data directory
 /// Returns null on error
-/// Caller must call dcli_store_free when done
+/// Caller must call dcli_store_close or dcli_store_free when done.
 #[no_mangle]
 pub extern "C" fn dcli_store_init(
     data_dir: *const c_char,
@@ -364,6 +364,7 @@ pub extern "C" fn dcli_store_init(
 }
 
 /// Initializes the store and returns per-call diagnostic JSON on success or failure.
+/// On failure, cleanup_verified is false when SQLite worker closure could not be verified.
 /// out_json may be null. When *out_json is non-null, free it with dcli_string_free.
 #[no_mangle]
 pub extern "C" fn dcli_store_init_with_diagnostics(
@@ -389,6 +390,7 @@ pub extern "C" fn dcli_store_init_with_diagnostics(
             "success": !store.is_null(),
             "source_revision": revision,
             "schema_version_before": diagnostics.schema_version_before,
+            "cleanup_verified": diagnostics.cleanup_verified,
             "events": diagnostics.events,
         });
         if let Ok(json) = CString::new(report.to_string()) {
@@ -487,7 +489,23 @@ fn store_init_impl(
 
         match (store, manifest) {
             (Ok(s), Ok(m)) => Some((s, m)),
-            _ => None,
+            (Ok(s), Err(_)) => {
+                if s.close().await.is_err() {
+                    if let Some(report) = diagnostics.as_deref_mut() {
+                        report.cleanup_verified = false;
+                    }
+                }
+                None
+            }
+            (Err(_), Ok(m)) => {
+                if m.close().await.is_err() {
+                    if let Some(report) = diagnostics.as_deref_mut() {
+                        report.cleanup_verified = false;
+                    }
+                }
+                None
+            }
+            (Err(_), Err(_)) => None,
         }
     });
 
@@ -501,7 +519,27 @@ fn store_init_impl(
     }
 }
 
-/// Frees a store created with dcli_store_init
+/// Consumes a store and waits for both SQLite workers to close.
+/// A non-null pointer is consumed even when closure fails; null is a successful no-op.
+#[no_mangle]
+pub extern "C" fn dcli_store_close(store: *mut DcliActivityStore) -> bool {
+    if store.is_null() {
+        return true;
+    }
+
+    let DcliActivityStore {
+        store,
+        manifest,
+        runtime,
+    } = *unsafe { Box::from_raw(store) };
+    runtime.block_on(async move {
+        let activity_closed = store.close().await.is_ok();
+        let manifest_closed = manifest.close().await.is_ok();
+        activity_closed && manifest_closed
+    })
+}
+
+/// Frees a store created with dcli_store_init without waiting for SQLite workers.
 #[no_mangle]
 pub extern "C" fn dcli_store_free(store: *mut DcliActivityStore) {
     if !store.is_null() {
