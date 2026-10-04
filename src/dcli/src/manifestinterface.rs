@@ -31,12 +31,14 @@ use sqlx::{ConnectOptions, Connection, SqliteConnection};
 use std::collections::HashMap;
 
 use crate::error::Error;
+use crate::initializationdiagnostics::InitializationDiagnostics;
 use crate::manifest::definitions::{
     ActivityDefinitionData, ActivityTypeDefinitionData,
     DestinationDefinitionData, DisplayPropertiesData,
     HistoricalStatsDefinition, InventoryItemDefinitionData,
     PlaceDefinitionData,
 };
+use std::time::Instant;
 
 pub const MANIFEST_FILE_NAME: &str = "manifest.sqlite3";
 
@@ -64,9 +66,28 @@ impl ManifestInterface {
         manifest_dir: &Path,
         cache: bool,
     ) -> Result<ManifestInterface, Error> {
+        Self::new_recording(manifest_dir, cache, None).await
+    }
+
+    pub async fn new_recording(
+        manifest_dir: &Path,
+        cache: bool,
+        mut diagnostics: Option<&mut InitializationDiagnostics>,
+    ) -> Result<ManifestInterface, Error> {
         let manifest_path = manifest_dir.join(MANIFEST_FILE_NAME);
 
-        if !manifest_path.exists() {
+        let started = Instant::now();
+        let exists = manifest_path.exists();
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record(
+                "manifest",
+                "manifest_exists",
+                started,
+                if exists { None } else { Some("missing_file") },
+                None,
+            );
+        }
+        if !exists {
             return Err(Error::IoFileDoesNotExist {
                 description: format!(
                     "Manifest path points to non-existent file. {}",
@@ -88,11 +109,26 @@ impl ManifestInterface {
         //as it can causes errors when opening a DB in readonly mode
         //We use Memory which should provide better performance
         //since we never write to the DB
-        let db = SqliteConnectOptions::from_str(connection_string)?
+        let started = Instant::now();
+        let options = SqliteConnectOptions::from_str(connection_string);
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record_sqlx(
+                "manifest",
+                "connect_options",
+                started,
+                &options,
+            );
+        }
+        let started = Instant::now();
+        let opened = options?
             .journal_mode(SqliteJournalMode::Memory)
             .read_only(read_only)
             .connect()
-            .await?;
+            .await;
+        if let Some(report) = diagnostics.as_deref_mut() {
+            report.record_sqlx("manifest", "open", started, &opened);
+        }
+        let db = opened?;
 
         /*
         if cache {

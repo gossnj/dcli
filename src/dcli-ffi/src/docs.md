@@ -17,7 +17,7 @@ This is the implementation layer called by mobile apps through C interop. The so
 **Sections**:
 1. **Platform Logging**: Conditional compilation for iOS (OSLog), Android (android_logger), or no-op. Filters sqlx query spam to Warn level.
 2. **API Client Functions**: Player search and stats retrieval from Bungie API
-3. **Activity Store Functions**: Database operations for syncing and querying activities
+3. **Activity Store Functions**: Database operations for syncing and querying activities, including an additive initializer that exposes native initialization diagnostics
 4. **Scoreboard Backfill Functions**: `dcli_store_backfill_scoreboard_values()` and `dcli_store_backfill_scoreboard_values_with_progress()` re-fetch PGCRs to populate scoreboard data for activities since Aug 2025 that were synced before scoreboardValues storage was implemented. Delegates to `ActivityStoreInterface::backfill_scoreboard_values()`. The no-progress variant delegates to the with-progress variant with a null callback.
 5. **Manifest Management**: Manifest download and update checking with 2-minute timeout
 6. **Utility Functions**: String memory management and error retrieval
@@ -51,7 +51,11 @@ Receives formatted message, current count, total count, and user data pointer.
 - "Starting sync..." / "Fetching history for WARLOCK (2/3)" / "Downloading activities (150/500)" / "Saving activities (150/500)" / "Sync complete! 500 activities synced"
 - Progress callback invoked on the same thread that called FFI; Swift/Kotlin must not block.
 
-**No Fine-Grained Error Reporting**: Functions return bool/i32 for success. Error details logged via platform logger (info!/error! macros) but not propagated to caller. `dcli_get_last_error()` stub exists but returns null.
+**General FFI Error Reporting**: Most functions return bool/i32 for success or counts. Error details are logged through the platform logger and are not propagated to callers. `dcli_get_last_error()` remains a stub returning null; store initialization has the separate diagnostic result described below.
+
+**Store Initialization Diagnostics**: `dcli_store_init_with_diagnostics()` is an additive C entry point alongside `dcli_store_init()`. It returns the same opaque store handle and optionally writes a versioned JSON payload with success, source revision, the pre-initialization schema version when readable, and ordered initialization events. Events identify database role and stage, outcome, elapsed milliseconds, a coarse error category, and an optional SQLite code. The caller frees a returned JSON string with `dcli_string_free()`; the existing store handle still uses `dcli_store_free()`. The older initializer and the `dcli_get_last_error()` stub retain their existing behavior.
+
+The embedded `source_revision` comes from `DCLI_BUILD_REVISION` at compile time when it contains a 40-character hexadecimal revision; otherwise it is `unknown`. This payload is limited to initialization and does not change the result contract of other FFI operations.
 
 **Database Stat Queries**: `dcli_store_get_crucible_stats()` hardcodes all-time period as 10 years in the past to now. Does not expose configurable time periods.
 
