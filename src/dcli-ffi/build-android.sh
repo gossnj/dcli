@@ -1,15 +1,14 @@
 #!/bin/bash
 set -e
 
+# Fail before invoking tools or creating build output when no key was provided.
+: "${DESTINY_API_KEY:?DESTINY_API_KEY must be set to a non-empty API key}"
+
 echo "🔨 Building dcli FFI for Android..."
 
-# Override the rust-toolchain.toml which pins to 1.70.0
-# We need a newer version for Android dependencies
-export RUSTUP_TOOLCHAIN=stable
-
-# API key required at compile time by dcli
-# This is a fallback; the actual key is passed at runtime
-export DESTINY_API_KEY="12197628758a4526a9c86afe4c4ad826"
+# Pin Rust for reproducible builds.
+export RUSTUP_TOOLCHAIN="1.83.0"
+rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
 # Build for all Android architectures
 # Output directly to the Android project's jniLibs directory
@@ -19,7 +18,7 @@ cargo ndk \
     -t x86_64 \
     -t x86 \
     -o ../../../app/src/main/jniLibs \
-    build --release
+    build --locked --release
 
 echo ""
 echo "✅ Android libraries built successfully!"

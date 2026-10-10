@@ -1,44 +1,43 @@
 #!/bin/bash
 set -e
 
-# Build script for Apple platforms (iOS, macOS, visionOS)
+# Packages macOS, iOS device, and iOS Simulator libraries.
 
-# Source cargo environment
+# Fail before sourcing tools or creating build output when no key was provided.
+: "${DESTINY_API_KEY:?DESTINY_API_KEY must be set to a non-empty API key}"
+
 source "$HOME/.cargo/env"
 
-# Export API key from .env file
-export DESTINY_API_KEY="12197628758a4526a9c86afe4c4ad826"
+# Use the workspace's supported Rust version for reproducible builds.
+export RUSTUP_TOOLCHAIN="1.83.0"
+rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
-# Define targets
 MACOS_TARGETS=("x86_64-apple-darwin" "aarch64-apple-darwin")
 IOS_TARGETS=("aarch64-apple-ios" "aarch64-apple-ios-sim" "x86_64-apple-ios")
 VISIONOS_TARGETS=("aarch64-apple-visionos" "aarch64-apple-visionos-sim")
 
-# Build directory
 BUILD_DIR="$(pwd)/build"
 mkdir -p "$BUILD_DIR"
 
 echo "Installing Rust targets..."
 for target in "${MACOS_TARGETS[@]}" "${IOS_TARGETS[@]}"; do
-    rustup target add "$target"
+    rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "$target"
 done
 
-# Note: visionOS targets require nightly Rust
-# rustup target add aarch64-apple-visionos --toolchain nightly
-# rustup target add aarch64-apple-visionos-sim --toolchain nightly
+# visionOS targets are placeholders; this script builds only macOS and iOS.
 
 echo ""
 echo "Building for macOS..."
 for target in "${MACOS_TARGETS[@]}"; do
     echo "  Building for $target..."
-    cargo build --release --target "$target"
+    cargo build --locked --release --target "$target"
 done
 
 echo ""
 echo "Building for iOS..."
 for target in "${IOS_TARGETS[@]}"; do
     echo "  Building for $target..."
-    cargo build --release --target "$target"
+    cargo build --locked --release --target "$target"
 done
 
 echo ""

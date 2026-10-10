@@ -1,81 +1,34 @@
 # Noridoc: dcli FFI Layer
 
-Path: @/dcli/src/dcli-ffi
+Path: @/src/dcli-ffi
 
 ### Overview
 
-Foreign Function Interface (FFI) wrapper that exposes dcli core library functionality to Swift/iOS applications via C-compatible ABI. Compiled as a static library (staticlib) for linking with Apple platform applications.
+- This crate exposes selected dcli library operations through a C-compatible interface for native clients.
+- The ABI is declared in the paired headers [dcli.h](dcli.h) and [build/dcli.h](build/dcli.h); the implementation is in [src/lib.rs](src/lib.rs).
+- Apple and Android build scripts compile target libraries and copy them into consumer locations.
 
 ### How it fits into the larger codebase
 
-This module bridges Rust dcli functionality to the Swift application at @/Last Banner. The Swift side at @/Last Banner/Services/DcliDatabaseService.swift calls these FFI functions through C interop. Build outputs (libdcli_ffi.a) are placed in @/RustLibraries as universal static libraries for macOS, iOS device, and iOS simulator architectures. The FFI layer depends on @/dcli/src/dcli for all actual functionality and only provides C-compatible wrappers.
+- The FFI adapts the shared Rust services in [../dcli](../dcli); it does not implement a separate API or persistence layer.
+- Native callers exchange opaque handles, C strings, primitive fields, and callbacks through the public header declarations.
+- [build-apple.sh](build-apple.sh) and [build-android.sh](build-android.sh) build platform libraries with Rust 1.83.0 and locked dependencies. Run the relevant script from this directory with a real `DESTINY_API_KEY`; Apple builds also use Xcode tools and `lipo`, while Android builds use `cargo ndk` and the Android NDK.
+- [../../tests/test_native_abi.py](../../tests/test_native_abi.py) checks C compilation and linking against both headers; [../../tests/native_init_diagnostics.py](../../tests/native_init_diagnostics.py) exercises the built shared library.
+- The Last Banner app consumes its own Rust library build and source pin. Updating this repository does not refresh that app's checked-in library artifacts.
 
 ### Core Implementation
 
-**Library Configuration** (@/dcli/src/dcli-ffi/Cargo.toml): `crate-type = ["staticlib"]` produces .a files for static linking.
-
-**Build Script**: @/dcli/src/dcli-ffi/build-apple.sh compiles for multiple Apple targets using rustup and lipo to create universal binaries.
-
-**Single Source File** (@/dcli/src/dcli-ffi/src/lib.rs, 884 lines): All FFI functions in one file.
-
-**Opaque Handle Pattern**:
-- `DcliApiClient` struct wraps `ApiInterface` + tokio runtime
-- `DcliActivityStore` struct wraps `ActivityStoreInterface` + `ManifestInterface` + tokio runtime
-- Swift receives opaque pointers, calls `_new()` to create, `_free()` to destroy
-
-**C-Compatible Structs**:
-- `DcliCrucibleStats` (`#[repr(C)]`): 15 f32 fields matching crucible stats (kills, deaths, KD, efficiency, etc.)
-- `DcliCharacter` (`#[repr(C)]`): id (i64), class_type (i32), minutes_played_total (i64)
-- `DcliManifestInfo` (`#[repr(C)]`): version and URL pointers with lengths
-
-**API Client Functions**:
-- `dcli_client_new(api_key: *const c_char) -> *mut DcliApiClient`: Creates API client
-- `dcli_client_free(client: *mut DcliApiClient)`: Destroys client
-- `dcli_search_player(client, bungie_name, out_member_id, out_platform) -> bool`: Player search
-- `dcli_get_crucible_stats(client, member_id, character_id, platform, mode, out_stats) -> bool`: Fetch stats from API
-- `dcli_get_characters(client, member_id, platform, out_characters, max_characters) -> i32`: Retrieve character list
-
-**Activity Store Functions**:
-- `dcli_store_init(data_dir: *const c_char) -> *mut DcliActivityStore`: Initialize store with path
-- `dcli_store_init_with_diagnostics(data_dir, out_json)`: Additive initializer returning a versioned per-call initialization report
-- `dcli_store_close(store) -> bool`: Consume the handle and await both activity and manifest SQLx connection workers; `true` means both closes succeeded. A non-null handle is consumed even when it returns `false` and cannot be reused.
-- `dcli_store_free(store)`: Legacy best-effort handle destruction that does not wait for SQLite workers
-- `dcli_store_add_player(store, bungie_name) -> bool`: Add player to sync list
-- `dcli_store_remove_player(store, bungie_name) -> bool`: Remove player from sync list
-- `dcli_store_sync_player(store, bungie_name) -> bool`: Sync activities from API
-- `dcli_store_sync_player_with_progress(store, bungie_name, callback, user_data) -> bool`: Sync with progress callbacks
-- `dcli_store_backfill_scoreboard_values(store) -> bool`: Backfill scoreboard data for post-Aug-2025 activities missing it. Idempotent.
-- `dcli_store_backfill_scoreboard_values_with_progress(store, callback, user_data) -> bool`: Same with progress callback
-- `dcli_store_get_crucible_stats(store, bungie_name, character_class, mode, out_stats) -> bool`: Query local database for stats
-
-**Manifest Management Functions**:
-- `dcli_manifest_needs_update(data_dir, out_needs_update) -> bool`: Check if manifest needs update
-- `dcli_manifest_download(data_dir, api_key) -> bool`: Download and install manifest from Bungie
-
-**Helper Functions**:
-- `dcli_string_free(s: *mut c_char)`: Free C strings allocated by FFI
-- `dcli_get_last_error() -> *mut c_char`: Get last error (currently stub returning null)
-
-**Progress Callback**: `ProgressCallback` type alias for C function pointer - `extern "C" fn(*const c_char, u32, u32, *mut c_void)` - allows Swift to receive progress updates during sync.
+- Each opaque API client or activity store owns the Rust state and Tokio runtime needed to bridge synchronous C calls to async dcli operations.
+- Store initialization can return a versioned JSON diagnostic report. The consuming close operation waits for activity and manifest connection workers; legacy free remains best-effort. See [src/lib.rs](src/lib.rs) and the ownership notes in [src/docs.md](src/docs.md).
+- Progress callbacks pass a temporary message, current and total values, and caller data through the C ABI. Both public headers declare the callback type and progress-aware sync functions, which are implemented in Rust.
+- The workspace builds current source. The tracked archives in [build](build) are historical and do not export `dcli_store_init_with_diagnostics` or `dcli_store_close`; rebuild before using those APIs.
 
 ### Things to Know
 
-**Tokio Runtime Management**: Each opaque handle owns its own tokio runtime. FFI functions use `runtime.block_on()` to synchronously execute async operations, blocking the calling thread until completion. This is necessary because C FFI cannot handle async/await.
-
-**Memory Safety**: All pointer parameters validated for null before dereferencing. CString/CStr conversions wrapped in match statements to handle UTF-8 errors. Box::into_raw() and Box::from_raw() manage heap allocation for opaque handles.
-
-**Error Handling**: FFI functions return bool for success/failure or i32 for counts. Rust Result/Option types converted to success booleans. No detailed error propagation to C side (last_error stub exists but unused).
-
-**Store Close Ownership**: Callers needing a completion result use `dcli_store_close()`. It consumes the opaque pointer before awaiting closure of the activity and manifest SQLx connections and reports true only when both close calls succeed. A false result still means ownership was consumed, so the pointer must not be reused or passed to `dcli_store_free()`. `dcli_store_free()` remains the legacy best-effort path and does not await those workers.
-
-**String Conversions**: Swift passes UTF-8 C strings (`*const c_char`). Rust converts via `CStr::from_ptr()` and validates `.to_str()`. Output strings allocated via `CString::new()` must be freed by caller via `dcli_string_free()`.
-
-**Stats Calculation** in `dcli_store_get_crucible_stats()`: Queries database for all-time stats (past 10 years using `DateTimePeriod`), converts `PlayerActivitiesSummary` to `DcliCrucibleStats`. Some fields like `average_kill_distance` and `suicides` unavailable in summary, set to 0.
-
-**Platform Encoding**: Platform IDs passed as i32, converted via `Platform::from_id()`. Mode IDs passed as i32, validated via `Mode::from_id()` which returns Result.
-
-**Character Class Selection**: Maps integer to enum - 0=Titan, 1=Hunter, 2=Warlock, 3=LastActive, _=All.
-
-**No Concurrent Access Safety**: FFI handles not thread-safe. Swift must ensure exclusive access or provide its own synchronization.
+- The `dcli.h` copies must remain aligned so native source and build consumers see the same declarations.
+- The API key is a compile-time input, and the build scripts stop before invoking toolchains or creating output when it is unset or empty.
+- A non-null store passed to the consuming close call is consumed even when closure reports failure; callers must not reuse the pointer.
+- The Apple script builds macOS, iOS device, and iOS Simulator static libraries; its output is placed in this crate's `build` directory. VisionOS target entries are currently commented because the script notes they require nightly Rust.
+- The Android script builds arm64-v8a, armeabi-v7a, x86_64, and x86 shared libraries and copies them to the consumer `jniLibs` directory configured by the script. These scripts create real artifacts, so use a real API key for consumer builds.
 
 Created and maintained by Nori.

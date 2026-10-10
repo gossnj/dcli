@@ -1,65 +1,30 @@
 # Noridoc: dclistat Source
 
-Path: @/dcli/src/dclistat/src
+Path: @/src/dclistat/src
 
 ### Overview
 
-Source implementation of dclistat command-line tool for displaying specific Destiny 2 PVP statistics with minimal formatting for scripting purposes.
+- [main.rs](main.rs) defines the `dclistat` parser, query flow, stat transformation, and output.
+- [cli_contract.rs](cli_contract.rs) records the parser behavior, including the required stat selection.
+- The executable delegates data access and calculations to the shared [dcli crate](../../dcli).
 
 ### How it fits into the larger codebase
 
-Implementation of dclistat CLI tool declared in @/dcli/src/dclistat/Cargo.toml. Uses @/dcli/src/dcli library for stat queries. Designed for shell script integration and automation where minimal, parseable output is preferred over formatted tables.
+- The CLI opens the same activity store populated by [dclisync](../../dclisync) and used by other reporting applications.
+- It calls shared date, mode, character, and stat parsers before asking `ActivityStoreInterface` for a filtered summary.
+- The package is built and tested as part of the workspace in [../Cargo.toml](../Cargo.toml).
 
 ### Core Implementation
 
-**Single File**: All logic in main.rs.
-
-**Key Characteristics**:
-- Minimal output formatting (just stat value)
-- Fast single-stat extraction
-- Script-friendly output format
-- Support for specific stat queries
-
-**Query Types**:
-- KD ratio
-- Win rate / Win percentage
-- Total kills
-- Total deaths
-- Games played
-- Efficiency
-- Specific mode stats
-- Time period filtered stats
-
-**Output Format**:
-```
-# Example
-$ dclistat --name player#1234 --stat kd
-1.45
-```
-
-Simple numeric output or stat=value pairs. Easy to parse with shell tools.
+- Clap requires a player name and at least one `--stat` value; one invocation can request several stats.
+- The runtime resolves the data directory, initializes the store, looks up the player, optionally syncs, and retrieves the summary for the selected date period, mode, and character class.
+- The output loop converts each selected field to text in the same order it was requested, then joins values with commas. Empty query results take the explicit `No data found` path.
+- The parser enables `--version`, and the adjacent contract tests exercise required and repeated stat values.
 
 ### Things to Know
 
-**Scripting Focus**: Primary use case is shell scripts and automation pipelines. Not designed for human-readable reports (use dcliah for that).
-
-**Performance**: Optimized for quick queries. May use database indexes effectively for targeted stat extraction.
-
-**Multiple Stats**: Some invocations may support multiple stats in single call, output one per line.
-
-**Data Source Options**: May query local database (fast) or live API (slow but current) depending on stat requested.
-
-**Combination with Other Tools**: Often piped or composed with other CLI tools:
-```bash
-# Example patterns
-kd=$(dclistat --name player#1234 --stat kd)
-if [ "$kd" -gt 1.5 ]; then echo "High KD!"; fi
-
-# Or store in CSV
-echo "player,kd,efficiency" > stats.csv
-dclistat --name player#1234 --stat kd,efficiency >> stats.csv
-```
-
-**Mode and Time Filters**: Supports same filtering as dcliah but returns just requested stat value(s).
+- Custom start and end moments require parsed RFC 3339 timestamps. `DateTimePeriod` rejects a range whose end is not after its start.
+- Optional sync errors are reported while existing local data remains available for the query; initialization, player lookup, and query errors terminate with a formatted message.
+- Summary values are formatted through shared dcli calculation helpers, keeping ratio and average behavior consistent with other tools.
 
 Created and maintained by Nori.

@@ -109,7 +109,7 @@ async fn download_manifest(url: &str, path: &Path) -> Result<(), Error> {
 }
 
 #[derive(Parser, Debug)]
-#[command(about, verbatim_doc_comment)]
+#[command(about, verbatim_doc_comment, version)]
 /// Command line tool for retrieving and managing the Destiny 2 manifest database.
 ///
 /// Manifest will be stored in the specified local directory with the file name:

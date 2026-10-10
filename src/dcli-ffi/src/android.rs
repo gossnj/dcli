@@ -1,9 +1,4 @@
-/*
- * JNI bindings for Android
- *
- * This module provides JNI wrappers around the C FFI functions
- * for use from Kotlin/Java on Android.
- */
+/* JNI wrappers for Kotlin and Java callers. */
 
 use jni::objects::{JClass, JFloatArray, JIntArray, JLongArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
@@ -19,21 +14,16 @@ use crate::{
     DcliApiClient, DcliCharacter, DcliCrucibleStats,
 };
 
-/// Helper to convert JString to CString, returning None on failure
 fn jstring_to_cstring(env: &mut JNIEnv, s: &JString) -> Option<CString> {
     let java_str = env.get_string(s).ok()?;
     let rust_str: String = java_str.into();
     CString::new(rust_str).ok()
 }
 
-/// Helper to throw a RuntimeException
 fn throw_runtime_exception(env: &mut JNIEnv, message: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", message);
 }
 
-// ============================================================================
-// CLIENT METHODS
-// ============================================================================
 
 /// Creates a new API client with the given Bungie API key
 /// Returns a pointer as jlong, or 0 on failure
@@ -76,9 +66,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     }
 }
 
-// ============================================================================
-// SEARCH PLAYER
-// ============================================================================
 
 /// Searches for a player by Bungie name
 /// Returns member_id, or 0 on failure (also sets out_platform)
@@ -120,7 +107,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
         return 0;
     }
 
-    // Write platform to output array
     let platform_array = [platform];
     if let Err(e) = env.set_int_array_region(&out_platform, 0, &platform_array)
     {
@@ -134,9 +120,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     member_id
 }
 
-// ============================================================================
-// GET CHARACTERS
-// ============================================================================
 
 /// Gets characters for a player
 /// Returns count of characters, fills output arrays
@@ -156,7 +139,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
         return 0;
     }
 
-    // Allocate space for up to 3 characters
     let mut characters = [
         DcliCharacter {
             id: 0,
@@ -187,7 +169,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
         return 0;
     }
 
-    // Fill output arrays
     let ids: Vec<i64> = characters
         .iter()
         .take(count as usize)
@@ -231,9 +212,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     count
 }
 
-// ============================================================================
-// GET CRUCIBLE STATS
-// ============================================================================
 
 /// Gets Crucible stats for a character from the API
 /// Returns true on success, fills output array with 15 floats
@@ -314,9 +292,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliClie
     1
 }
 
-// ============================================================================
-// STORE METHODS
-// ============================================================================
 
 /// Initializes the activity store with the given data directory
 /// Returns a pointer as jlong, or 0 on failure
@@ -521,7 +496,6 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
         return 0;
     }
 
-    // Pack stats into array
     let stats_array: [jfloat; 15] = [
         stats.activities_entered,
         stats.activities_won,
@@ -551,13 +525,8 @@ pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStor
     1
 }
 
-// ============================================================================
-// MANIFEST METHODS
-// ============================================================================
 
-/// Checks if the manifest needs updating
-/// Returns true if update needed, false if current
-/// Returns -1 on error
+/// Checks manifest freshness: 1 needs an update, 0 is current, and -1 is an error.
 #[no_mangle]
 pub extern "system" fn Java_com_ottercreeksoftware_lastbanner_data_dcli_DcliStore_nativeManifestNeedsUpdate(
     mut env: JNIEnv,

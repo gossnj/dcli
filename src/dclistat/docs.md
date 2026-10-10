@@ -1,32 +1,30 @@
-# Noridoc: dclistat CLI Tool
+# Noridoc: dclistat CLI
 
-Path: @/dcli/src/dclistat
+Path: @/src/dclistat
 
 ### Overview
 
-Command-line tool for displaying specific Destiny 2 PVP statistics. Focused utility for querying individual stat values from aggregated player data.
+- `dclistat` prints selected Crucible summary statistics for a Bungie player.
+- It queries the shared local activity database through [dcli](../dcli), using the same data created by [dclisync](../dclisync).
+- The command-line contract is exercised in [src/cli_contract.rs](src/cli_contract.rs).
 
 ### How it fits into the larger codebase
 
-Uses @/dcli/src/dcli library to query statistics from the local database or live API. Complements @/dcli/src/dcliah by providing targeted stat queries rather than comprehensive reports. Useful for scripting and automation where only specific metrics are needed.
+- The executable uses the common activity-store interface and shared parsers/calculations rather than maintaining separate API or database logic.
+- It can request a sync before querying with `--sync`; otherwise it reads existing data for the selected time window, mode, and character class.
+- Workspace test and smoke commands are documented in [../../tests/README.md](../../tests/README.md).
 
 ### Core Implementation
 
-**Targeted Stat Queries**:
-- Individual stats like KD ratio, win rate, kills, deaths
-- Specific mode performance
-- Single metric extraction
-
-**Output**: Simple formatted output suitable for parsing by scripts or piping to other tools.
-
-**Data Sources**: Can query both local database (via ActivityStoreInterface) and live API (via ApiInterface) depending on stat requested.
+- Clap requires a Bungie name and one or more `--stat` values. It parses the requested mode, time range, and character class before store access.
+- The tool resolves the data directory and initializes the activity store, looks up the player, optionally syncs, then retrieves a summary for the chosen filters.
+- Each requested stat is transformed from the summary into its CLI representation and emitted in request order as comma-separated values. A missing summary prints `No data found` and returns.
+- `--version` is enabled in the Clap command metadata.
 
 ### Things to Know
 
-**Scripting Focus**: Designed for integration with shell scripts and automation. Output format optimized for parsing.
-
-**Stat Specificity**: Rather than showing all stats, allows querying just the stat(s) you need. Reduces noise for automation.
-
-**Fast Queries**: Optimized for quick single-stat lookups from database.
+- Custom date moments require their corresponding RFC 3339 timestamps, and the end time must be later than the start time; invalid periods exit before querying.
+- Store initialization and player lookup failures are reported at the CLI boundary. If an optional sync fails, the tool reports that condition and continues with existing stored data.
+- The compiled binary requires a compile-time API key; API-backed runtime actions can also receive the key through `--api-key` or `DESTINY_API_KEY`.
 
 Created and maintained by Nori.

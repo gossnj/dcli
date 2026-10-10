@@ -30,7 +30,7 @@ use dcli::utils::build_tsv;
 use tell::{Tell, TellLevel};
 
 #[derive(Parser, Debug)]
-#[command(about, verbatim_doc_comment)]
+#[command(about, verbatim_doc_comment, version)]
 /// Command line tool for retrieving date / time stamps for Destiny 2 weekly event
 /// moments
 ///

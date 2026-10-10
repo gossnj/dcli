@@ -21,6 +21,15 @@ typedef struct DcliActivityStore DcliActivityStore;
 typedef struct DcliApiClient DcliApiClient;
 
 /**
+ * Receives sync progress. The message is valid only during the callback.
+ * user_data is passed through unchanged.
+ */
+typedef void (*DcliProgressCallback)(const char *message,
+                                     uint32_t current,
+                                     uint32_t total,
+                                     void *user_data);
+
+/**
  * Represents a Crucible stats result from the API
  */
 typedef struct DcliCrucibleStats {
@@ -140,6 +149,14 @@ bool dcli_store_remove_player(struct DcliActivityStore *store, const char *bungi
 bool dcli_store_sync_player(struct DcliActivityStore *store, const char *bungie_name);
 
 /**
+ * Syncs a player and reports progress. callback may be null.
+ */
+bool dcli_store_sync_player_with_progress(struct DcliActivityStore *store,
+                                           const char *bungie_name,
+                                           DcliProgressCallback callback,
+                                           void *user_data);
+
+/**
  * Backfills scoreboard_result data for activities since Aug 2025
  * that are missing it. Idempotent — returns early if nothing to backfill.
  * Returns true on success, false on error
@@ -147,9 +164,15 @@ bool dcli_store_sync_player(struct DcliActivityStore *store, const char *bungie_
 bool dcli_store_backfill_scoreboard_values(struct DcliActivityStore *store);
 
 /**
- * Gets Crucible stats from the local database for a character
- * Uses the `all_time` time period
- * Returns true on success, false on error
+ * Backfills scoreboard data and reports progress. callback may be null.
+ */
+bool dcli_store_backfill_scoreboard_values_with_progress(struct DcliActivityStore *store,
+                                                          DcliProgressCallback callback,
+                                                          void *user_data);
+
+/**
+ * Gets local Crucible stats for a character over the past ten years.
+ * Returns true on success, false on error.
  */
 bool dcli_store_get_crucible_stats(struct DcliActivityStore *store,
                                    const char *bungie_name,
@@ -158,8 +181,8 @@ bool dcli_store_get_crucible_stats(struct DcliActivityStore *store,
                                    struct DcliCrucibleStats *out_stats);
 
 /**
- * Checks if a manifest needs updating
- * Returns true if update needed, false otherwise
+ * Checks manifest freshness and writes it to out_needs_update.
+ * Returns true on success, false on error.
  */
 bool dcli_manifest_needs_update(const char *data_dir, bool *out_needs_update);
 
@@ -170,14 +193,12 @@ bool dcli_manifest_needs_update(const char *data_dir, bool *out_needs_update);
 bool dcli_manifest_download(const char *data_dir, const char *api_key);
 
 /**
- * Creates a string that can be freed with dcli_string_free
+ * Frees a string returned by dcli. Null is a no-op.
  */
 void dcli_string_free(char *s);
 
 /**
- * Gets the last error message
- * Returns null if no error
- * Caller must free the returned string with dcli_string_free
+ * Compatibility stub: always returns null. Use per-call initialization diagnostics.
  */
 char *dcli_get_last_error(void);
 

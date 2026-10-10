@@ -853,7 +853,7 @@ impl ApiInterface {
             instance_id = instance_id,
         );
 
-        // Retry logic with exponential backoff for transient failures
+        // Retry transient API and transport failures with exponential backoff.
         const MAX_RETRIES: u32 = 3;
         const BASE_DELAY_MS: u64 = 100;
 
@@ -861,7 +861,6 @@ impl ApiInterface {
 
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
-                // Exponential backoff: 100ms, 200ms, 400ms
                 let delay = BASE_DELAY_MS * (1 << attempt);
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay))
                     .await;
@@ -879,7 +878,6 @@ impl ApiInterface {
                             {
                                 return Ok(None);
                             } else {
-                                // API returned error status - retry
                                 last_error = Some(Error::ApiRequest {
                                     description: format!(
                                         "API error code {} for PGCR {}",
@@ -894,13 +892,11 @@ impl ApiInterface {
                 }
                 Err(e) => {
                     last_error = Some(e);
-                    // Network/parse error - retry
                     continue;
                 }
             }
         }
 
-        // All retries exhausted
         Err(last_error.unwrap_or_else(|| Error::ApiRequest {
             description: format!(
                 "Failed to retrieve PGCR {} after {} retries",

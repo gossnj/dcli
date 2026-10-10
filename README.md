@@ -140,24 +140,24 @@ All dcli apps have support for log output via the [env_logger](https://docs.rs/e
 
 ## Compiling
 
-Tools are written and compiled in [Rust](https://www.rust-lang.org/). The 1.50.0 rust version is required, which can be installed and set via:
+This section applies when building from source; installing a prebuilt release does not require the Cargo build step. Tools are written in [Rust](https://www.rust-lang.org/) and the workspace pins Rust 1.83.0 in [src/rust-toolchain.toml](src/rust-toolchain.toml). Source builds require `DESTINY_API_KEY` at compile time, and embed that key in the resulting binaries. Use a real Bungie API key for binaries intended for normal use; the validation-only value used in CI is confined to isolated checks.
 
 ```
-$ rustup toolchain install 1.50.0
-$ rustup override set 1.50.0
+$ rustup toolchain install 1.83.0
+$ export DESTINY_API_KEY=YOUR_BUNGIE_API_KEY
 ```
 
 ![Build Status](https://github.com/mikechambers/dcli/workflows/dcli/badge.svg)
 
-When compiling you must have an environment variable named `DESTINY_API_KEY` which contains your [Bungie API key](https://www.bungie.net/en/Application).
-
-To compile, switch to the `src/` directory and run:
+To compile the workspace from the repository root, run:
 
 ```
-$ cargo build --release
+$ cargo +1.83.0 build --locked --manifest-path src/Cargo.toml --workspace --release
 ```
 
-which will place the compiled tools in _src/target/release_
+The executables are placed in `src/target/release`. See [tests/README.md](tests/README.md) for workspace and CLI validation commands.
+
+All seven command-line tools support `--version`. `dclisync` accepts multiple names for `--add` and `--remove`, and `--sync` accepts multiple names or no names to sync all configured players. `dclistat` requires one or more `--stat` values and can print several selected statistics in one invocation.
 
 ## Privacy
 

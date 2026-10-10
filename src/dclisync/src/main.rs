@@ -38,7 +38,7 @@ const DEFAULT_REFRESH_INTERVAL: u32 = 60;
 const SHOULD_CONTINUE_CODE: i32 = -1;
 
 #[derive(Parser, Debug)]
-#[command(about, verbatim_doc_comment)]
+#[command(about, verbatim_doc_comment, version)]
 /// Command line tool for downloading and syncing Destiny 2 Crucible activity
 /// history to a sqlite3 database file.
 ///
@@ -93,6 +93,7 @@ struct Opt {
     #[arg(
         long = "sync",
         short = 's',
+        num_args = 0..,
         required_unless_present_any = ["list", "add", "remove", "import_group"],
         requires = "api_key"
     )]
@@ -109,7 +110,7 @@ struct Opt {
     /// or DESTINY_API_KEY environment variable.
     ///
     /// You can obtain a key from https://www.bungie.net/en/Application
-    #[arg(long = "add", short = 'A', requires = "api_key")]
+    #[arg(long = "add", short = 'A', num_args = 1.., requires = "api_key")]
     add: Option<Vec<PlayerName>>,
 
     /// Remove specified player(s) from having their activities synced.
@@ -120,7 +121,7 @@ struct Opt {
     /// Name(s) must be in the format of NAME#CODE. Example: foo#3280
     /// You can find your name in game, or on Bungie's site at:
     /// https://www.bungie.net/7/en/User/Account/IdentitySettings
-    #[arg(long = "remove", short = 'r')]
+    #[arg(long = "remove", short = 'r', num_args = 1..)]
     remove: Option<Vec<PlayerName>>,
 
     ///List all Bungie names which are flagged to be synced.
@@ -472,3 +473,6 @@ async fn main() {
         tell::update!("");
     }
 }
+
+#[cfg(test)]
+mod cli_contract;

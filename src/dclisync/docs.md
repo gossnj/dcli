@@ -1,52 +1,31 @@
-# Noridoc: dclisync CLI Tool
+# Noridoc: dclisync CLI
 
-Path: @/dcli/src/dclisync
+Path: @/src/dclisync
 
 ### Overview
 
-Command-line tool for downloading and syncing Destiny 2 Crucible activity history from the Bungie API into a local SQLite database. Primary tool for building the activity datastore that other dcli tools query.
+- `dclisync` manages the local activity-store player list and downloads Crucible history from Bungie.
+- Other command-line tools and the FFI query the store populated by this CLI through the shared [dcli library](../dcli).
+- Argument parsing and operation ordering are covered beside the implementation in [src/cli_contract.rs](src/cli_contract.rs).
 
 ### How it fits into the larger codebase
 
-dclisync is the data ingestion layer for dcli. It uses @/dcli/src/dcli `ActivityStoreInterface` to manage the database at a user-specified path. Other CLI tools like @/dcli/src/dcliah query the database that dclisync populates. The FFI layer at @/dcli/src/dcli-ffi exposes equivalent sync functionality via `dcli_store_sync_player()` for the Swift app at @/Last Banner.
+- The CLI resolves a data directory and initializes `ActivityStoreInterface`; the default location comes from shared utilities in [../dcli/src/utils.rs](../dcli/src/utils.rs).
+- Add, remove, and sync operations update or read the same store used by reporting tools such as [dclistat](../dclistat) and [dcliah](../dcliah).
+- Bungie requests use the core API client and require a key for API-backed operations. At runtime the key can come from `--api-key` or `DESTINY_API_KEY`; compilation also requires `DESTINY_API_KEY` because it is embedded in the binary.
+- The Rust 1.83.0 workspace tests and executable smoke checks are documented in [../../tests/README.md](../../tests/README.md).
 
 ### Core Implementation
 
-**Single Main File** (@/dcli/src/dclisync/src/main.rs, 16609 lines): All CLI logic in main.rs.
-
-**Dependencies** (@/dcli/src/dclisync/Cargo.toml):
-- structopt: Command-line argument parsing
-- tokio: Async runtime with full feature set
-- log + env_logger: RUST_LOG environment variable support
-- Platform-specific: signal-hook (Unix) / ctrlc (Windows) for graceful shutdown
-
-**Core Operations**:
-- **Add Player**: Add Bungie name to sync list in database
-- **Remove Player**: Remove player from sync list
-- **Sync**: Download activity history for all players in sync list
-- **Sync Single**: Sync specific player without adding to list
-
-**Data Flow**:
-1. Parse command-line arguments (player name, data directory, operation)
-2. Initialize `ActivityStoreInterface` with data directory path
-3. Execute operation: add_player_to_sync(), remove_player_from_sync(), or sync_player()
-4. ActivityStoreInterface handles API calls, PGCR fetching, database insertion
-5. Progress feedback via indicatif progress bars (from dcli library)
-
-**Signal Handling**: Registers SIGTERM/SIGINT handlers for graceful shutdown during long-running syncs. Allows database to be left in consistent state if interrupted.
+- Clap parses player names into `PlayerName` values before store operations. `--add` and `--remove` accept one or more names; `--sync` accepts zero or more, where zero names means sync every configured player.
+- Multiple requested operations run in a defined order: import group members, add names, remove names, sync, then list configured players.
+- Sync can run once or in daemon mode. The sync path chooses `sync_all` for an empty name list and `sync_players` for explicit names; interval controls daemon pauses.
+- `--version` is provided by the Clap command metadata, and parser contract tests exercise version output and argument requirements.
 
 ### Things to Know
 
-**Initial Sync Duration**: First sync of a player with extensive history can take several minutes. Subsequent syncs are fast since only new activities are fetched.
-
-**Concurrent Requests**: Uses chunked concurrent requests (25 at a time) to Bungie API for PGCR data. Balance between speed and API rate limiting.
-
-**Database Location**: Default is system data directory (e.g., `~/Library/Application Support/dcli` on macOS). Can be overridden with command-line option. Both dclisync and querying tools must point to same database path.
-
-**Incremental Syncing**: Smart about only fetching activities not already in database. Tracks last sync time per player in sync table.
-
-**API Key Requirement**: Must have DESTINY_API_KEY environment variable set at compile time. Key embedded in binary.
-
-**Error Recovery**: If sync fails partway through, can simply re-run. Will resume from where it left off. Database transactions ensure consistency.
+- Sync, add, and group import require an API key. Listing and removing configured players do not perform Bungie API lookups.
+- Player-name validation happens during Clap parsing, before the database is opened. Runtime API or database failures are formatted at the CLI boundary and terminate the relevant operation.
+- Interrupt handling is platform-specific: Unix listens for termination signals and Windows uses Ctrl-C handling so a running sync can finish its current operation and shut down.
 
 Created and maintained by Nori.

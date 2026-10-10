@@ -470,7 +470,7 @@ fn print_default(
 }
 
 #[derive(Parser, Debug)]
-#[command(about, verbatim_doc_comment)]
+#[command(about, verbatim_doc_comment, version)]
 /// Command line tool for retrieving and viewing Destiny 2 Crucible activity details.
 ///
 /// By default the details on the last activity will be displayed, and you can

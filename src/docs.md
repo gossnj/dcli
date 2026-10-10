@@ -1,37 +1,31 @@
-# Noridoc: dcli Source Root
+# Noridoc: Rust Workspace
 
-Path: @/dcli/src
+Path: @/src
 
 ### Overview
 
-The dcli workspace contains a collection of Rust utilities and libraries for interacting with the Destiny 2 API. This includes command-line tools for viewing player stats, a core library providing common functionality, and an FFI wrapper for integration with Swift/iOS applications.
+- This Cargo workspace builds the shared dcli library, native FFI library, console output support, and Destiny 2 CLI applications.
+- All workspace crates use the root [Cargo.toml](Cargo.toml) and [Cargo.lock](Cargo.lock); the toolchain is pinned in [rust-toolchain.toml](rust-toolchain.toml).
+- The API key is read during compilation from `DESTINY_API_KEY` and embedded in the resulting binaries.
 
 ### How it fits into the larger codebase
 
-The dcli source tree is the backend of the Last Banner application. The @/dcli/src/dcli-ffi module provides C-compatible FFI bindings that bridge Rust functionality to the Swift/iOS frontend at @/Last Banner. The core @/dcli/src/dcli library handles all Destiny 2 API communication, data persistence via SQLite, and manifest management. Command-line tools (dclisync, dcliah, dclim, etc.) provide standalone functionality and serve as reference implementations of the library's capabilities.
+- The core crate in [dcli](dcli) owns Bungie API access, activity storage, manifest access, and shared types.
+- [dclisync](dclisync) writes activity data through the core store; the reporting applications query that same local database.
+- [dcli-ffi](dcli-ffi) adapts core operations to a C ABI for native application clients, while [tell](tell) supplies shared console output behavior.
+- Workspace validation is run from the repository root with `cargo +1.83.0 test --locked --workspace --manifest-path src/Cargo.toml` and the corresponding `build` command. `DESTINY_API_KEY` must be set for both.
 
 ### Core Implementation
 
-This is a Cargo workspace with 8 workspace members defined in @/dcli/src/Cargo.toml:
-- **dcli**: Core library providing API client, activity storage, manifest management, and data structures
-- **dcli-ffi**: FFI wrapper exposing dcli functionality to Swift via C ABI (compiled as staticlib)
-- **tell**: Output/logging library for console applications
-- **dclisync**: CLI tool for syncing activity history from Bungie API to local SQLite database
-- **dcliah**: CLI tool for displaying activity history and stats
-- **dclim**: CLI tool for downloading and managing the Destiny 2 manifest database
-- **dcliad**: CLI tool for displaying detailed activity/match information
-- **dclia**, **dclistat**, **dclitime**: Additional CLI utilities
-
-The workspace uses aggressive size optimization in release builds: `opt-level = 'z'`, `lto = true`, `codegen-units = 1`.
+- Cargo workspace membership and shared dependency/build settings are declared in [Cargo.toml](Cargo.toml); checked-in versions are resolved by [Cargo.lock](Cargo.lock).
+- The application crates parse CLI inputs and call shared services instead of owning independent API or persistence implementations.
+- The FFI crate owns C-compatible handles and wrappers around async core operations. Its native declarations and artifact rebuild guidance are documented in [dcli-ffi/docs.md](dcli-ffi/docs.md).
+- Rust unit tests cover shared data-layer behavior and CLI parsing; repository-level native and executable checks are described in [../tests/README.md](../tests/README.md).
 
 ### Things to Know
 
-**Compilation requires DESTINY_API_KEY environment variable** - The Bungie API key must be available at compile time.
-
-**API Data Correction Logic**: The codebase includes sophisticated logic to fix inconsistencies in Bungie's API, particularly around Competitive mode detection starting in Season 25. This is implemented in @/dcli/src/dcli/src/activitystoreinterface.rs `fix_pgcr_data()` function which transforms incorrect mode IDs (e.g., ClashQuickplay → ClashCompetitive) based on `director_activity_hash` values.
-
-**Three-tier architecture**: API layer (@/dcli/src/dcli/src/apiinterface.rs), persistence layer (@/dcli/src/dcli/src/activitystoreinterface.rs), and presentation layer (CLI tools or FFI).
-
-**Platform targets**: The FFI layer is specifically designed for Apple platforms (iOS, macOS, visionOS) and is compiled as a universal static library via @/dcli/src/dcli-ffi/build-apple.sh.
+- Rust 1.83.0 is the workspace toolchain. Builds and tests use `--locked` to keep the dependency graph stable.
+- CI uses a validation-only API key for isolated compile and test jobs. That value is not a substitute for a real key when building binaries for use.
+- Apple and Android helper scripts create and copy native build outputs. They require a non-empty `DESTINY_API_KEY` before doing build work; see [dcli-ffi/build-apple.sh](dcli-ffi/build-apple.sh) and [dcli-ffi/build-android.sh](dcli-ffi/build-android.sh).
 
 Created and maintained by Nori.

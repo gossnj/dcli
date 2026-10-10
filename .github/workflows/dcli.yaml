@@ -1,39 +1,112 @@
 name: dcli
 
-on: [push]
+on:
+    pull_request:
+    push:
+        branches:
+            - '**'
+        tags:
+            - '**'
+
+permissions:
+    contents: read
 
 jobs:
+    validate-host:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Install Rust 1.83.0
+              run: rustup toolchain install 1.83.0 --profile minimal
+            - name: Test workspace
+              env:
+                  DESTINY_API_KEY: validation-only-key
+              run: cargo +1.83.0 test --locked --manifest-path=src/Cargo.toml --workspace
+            - name: Build host binaries
+              env:
+                  DESTINY_API_KEY: validation-only-key
+              run: cargo +1.83.0 build --locked --manifest-path=src/Cargo.toml --workspace
+            - name: Run build and CLI checks
+              run: |
+                  python3 -B -m unittest discover -s tests -p 'test_build_scripts.py'
+                  python3 -B -m unittest discover -s tests -p 'test_cli_smoke.py'
+                  python3 -B tests/test_native_abi.py src/target/debug/libdcli_ffi.so
+                  python3 -B tests/native_init_diagnostics.py src/target/debug/libdcli_ffi.so
+
     build-linux-musl:
+        needs: validate-host
         runs-on: ubuntu-latest
         steps:
             - name: Setup Config
               id: config
               run: |
-                  echo ::set-output name=SOURCE_TAG::${GITHUB_REF/refs\/tags\//}
-                  echo ::set-output name=TARGET_NAME::x86_64-unknown-linux-musl
-            - uses: actions/checkout@master
-            - name: Build
-              uses: stevenleadbeater/rust-musl-builder@master
-              with:
-                  args: /bin/bash -c "export DESTINY_API_KEY=${{ secrets.DESTINY_API_KEY }} && rustup toolchain install 1.65.0 && rustup target add x86_64-unknown-linux-musl --toolchain=1.65.0 && rustup override set 1.65.0 && cargo build --manifest-path=src/Cargo.toml --release --target=x86_64-unknown-linux-musl"
+                  echo "SOURCE_TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+                  echo "TARGET_NAME=x86_64-unknown-linux-musl" >> "$GITHUB_OUTPUT"
+            - uses: actions/checkout@v4
+            - name: Require release key
+              if: startsWith(github.ref, 'refs/tags/')
+              env:
+                  DESTINY_API_KEY: ${{ secrets.DESTINY_API_KEY }}
+              run: test -n "$DESTINY_API_KEY" || { echo 'DESTINY_API_KEY is required for tagged releases' >&2; exit 1; }
+            - name: Install Rust 1.83.0 and musl build tools
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --yes musl-tools perl make
+                  rustup toolchain install 1.83.0 --profile minimal --target x86_64-unknown-linux-musl
+            - name: Build pinned static OpenSSL for musl
+              env:
+                  OPENSSL_VERSION: 3.5.9
+                  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+              run: |
+                  archive="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}.tar.gz"
+                  checksum="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}.tar.gz.sha256"
+                  source_dir="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
+                  install_dir="$RUNNER_TEMP/openssl-musl"
+                  curl --fail --location --silent --show-error "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" --output "$archive"
+                  curl --fail --location --silent --show-error "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz.sha256" --output "$checksum"
+                  test "$(awk '{ print $1 }' "$checksum")" = "$OPENSSL_SHA256"
+                  echo "${OPENSSL_SHA256}  ${archive}" | sha256sum --check --status
+                  mkdir -p "$source_dir"
+                  tar --extract --gzip --file "$archive" --directory "$source_dir" --strip-components=1
+                  cd "$source_dir"
+                  CC=musl-gcc ./Configure linux-x86_64 no-shared no-tests --prefix="$install_dir" --openssldir="$install_dir/ssl"
+                  make --jobs="$(nproc)"
+                  make install_sw
+                  echo "OPENSSL_DIR=$install_dir" >> "$GITHUB_ENV"
+                  echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+            - name: Build validation binaries
+              if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+              env:
+                  DESTINY_API_KEY: validation-only-key
+                  OPENSSL_DIR: ${{ runner.temp }}/openssl-musl
+                  OPENSSL_STATIC: '1'
+                  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+              run: cargo +1.83.0 build --bins --locked --manifest-path=src/Cargo.toml --release --target x86_64-unknown-linux-musl
+            - name: Build release binaries
+              if: startsWith(github.ref, 'refs/tags/')
+              env:
+                  DESTINY_API_KEY: ${{ secrets.DESTINY_API_KEY }}
+                  OPENSSL_DIR: ${{ runner.temp }}/openssl-musl
+                  OPENSSL_STATIC: '1'
+                  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+              run: cargo +1.83.0 build --bins --locked --manifest-path=src/Cargo.toml --release --target x86_64-unknown-linux-musl
             - name: Process and Package
-              if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+              if: startsWith(github.ref, 'refs/tags/')
               env:
                   SOURCE_TAG: ${{ steps.config.outputs.SOURCE_TAG }}
                   TARGET_NAME: ${{ steps.config.outputs.TARGET_NAME }}
               run: echo SOURCE_TAG ${SOURCE_TAG} && echo TARGET_NAME ${TARGET_NAME} && ls -l src/target/ && cp src/target/${TARGET_NAME}/release/dclia . && strip dclia  && cp src/target/${TARGET_NAME}/release/dcliad . && strip dcliad && cp src/target/${TARGET_NAME}/release/dclim . && strip dclim && cp src/target/${TARGET_NAME}/release/dclitime . && strip dclitime && cp src/target/${TARGET_NAME}/release/dcliah . && strip dcliah && cp src/target/${TARGET_NAME}/release/dclisync . && strip dclisync && cp src/target/${TARGET_NAME}/release/dclistat . && strip dclistat && zip -j dcli_${TARGET_NAME}_${SOURCE_TAG}.zip RELEASE.md README.md LICENSE.md dclia dcliad dclim dclitime dcliah dclisync dclistat
 
-            - name: Release
-              uses: softprops/action-gh-release@v1
+            - name: Upload release package
               if: startsWith(github.ref, 'refs/tags/')
+              uses: actions/upload-artifact@v7
               with:
-                  files: |
-                      dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip
-                      RELEASE.md
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  name: dcli-linux-musl
+                  path: dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip
+                  if-no-files-found: error
 
     build-windows-msvc:
+        needs: validate-host
         runs-on: windows-latest
         steps:
             #set some environement variables that we can use through the rest of our
@@ -41,84 +114,126 @@ jobs:
             - name: Setup Config
               id: config
               run: |
-                  echo ::set-output name=SOURCE_TAG::${GITHUB_REF/refs\/tags\//}
-                  echo ::set-output name=TARGET_NAME::x86_64-pc-windows-msvc
+                  echo "SOURCE_TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+                  echo "TARGET_NAME=x86_64-pc-windows-msvc" >> "$GITHUB_OUTPUT"
               shell: bash
 
-            - uses: actions/checkout@v2
-            - uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: stable
-                  target: ${{ steps.config.outputs.TARGET_NAME }}
-                  override: true
-            - name: Build
-              uses: actions-rs/cargo@v1
+            - uses: actions/checkout@v4
+            - name: Require release key
+              if: startsWith(github.ref, 'refs/tags/')
+              env:
+                  DESTINY_API_KEY: ${{ secrets.DESTINY_API_KEY }}
+              run: test -n "$DESTINY_API_KEY" || { echo 'DESTINY_API_KEY is required for tagged releases' >&2; exit 1; }
+              shell: bash
+            - name: Install Rust 1.83.0
+              run: rustup toolchain install 1.83.0 --profile minimal --target x86_64-pc-windows-msvc
+              shell: bash
+            - name: Build validation binaries
+              if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+              env:
+                  DESTINY_API_KEY: validation-only-key
+                  RUSTFLAGS: "-C target-feature=+crt-static"
+              run: cargo +1.83.0 build --bins --locked --manifest-path=src/Cargo.toml --release --target x86_64-pc-windows-msvc
+              shell: bash
+            - name: Build release binaries
+              if: startsWith(github.ref, 'refs/tags/')
               env:
                   DESTINY_API_KEY: ${{ secrets.DESTINY_API_KEY }}
                   RUSTFLAGS: "-C target-feature=+crt-static"
-              with:
-                  use-cross: true
-                  command: build
-                  args: --manifest-path=src/Cargo.toml --release --target ${{ steps.config.outputs.TARGET_NAME }}
+              run: cargo +1.83.0 build --bins --locked --manifest-path=src/Cargo.toml --release --target x86_64-pc-windows-msvc
+              shell: bash
             - name: Process
-              if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+              if: startsWith(github.ref, 'refs/tags/')
               env:
                   SOURCE_TAG: ${{ steps.config.outputs.SOURCE_TAG }}
                   TARGET_NAME: ${{ steps.config.outputs.TARGET_NAME }}
-              run: rustup.exe toolchain install 1.65.0 && rustup.exe override set 1.65.0 && echo SOURCE_TAG ${SOURCE_TAG} && cp src/target/${TARGET_NAME}/release/dclia.exe . && strip dclia.exe && cp src/target/${TARGET_NAME}/release/dcliad.exe . && strip dcliad.exe && cp src/target/${TARGET_NAME}/release/dclim.exe . && strip dclim.exe && cp src/target/${TARGET_NAME}/release/dclitime.exe . && strip dclitime.exe && cp src/target/${TARGET_NAME}/release/dcliah.exe . && strip dcliah.exe && cp src/target/${TARGET_NAME}/release/dclisync.exe . && strip dclisync.exe && cp src/target/${TARGET_NAME}/release/dclistat.exe . && strip dclistat.exe
+              run: echo SOURCE_TAG ${SOURCE_TAG} && cp src/target/${TARGET_NAME}/release/dclia.exe . && strip dclia.exe && cp src/target/${TARGET_NAME}/release/dcliad.exe . && strip dcliad.exe && cp src/target/${TARGET_NAME}/release/dclim.exe . && strip dclim.exe && cp src/target/${TARGET_NAME}/release/dclitime.exe . && strip dclitime.exe && cp src/target/${TARGET_NAME}/release/dcliah.exe . && strip dcliah.exe && cp src/target/${TARGET_NAME}/release/dclisync.exe . && strip dclisync.exe && cp src/target/${TARGET_NAME}/release/dclistat.exe . && strip dclistat.exe
               shell: bash
             - name: Package
-              if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-              run: Compress-Archive -Path RELEASE.md, README.md, LICENSE.md, dclia.exe, dcliad.exe, dclim.exe, dclitime.exe, dcliah.exe, dclisync.exe, dclistat.exe -DestinationPath dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip -CompressionLevel Optimal
-            - name: Release
-              uses: softprops/action-gh-release@v1
               if: startsWith(github.ref, 'refs/tags/')
+              run: Compress-Archive -Path RELEASE.md, README.md, LICENSE.md, dclia.exe, dcliad.exe, dclim.exe, dclitime.exe, dcliah.exe, dclisync.exe, dclistat.exe -DestinationPath dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip -CompressionLevel Optimal
+            - name: Upload release package
+              if: startsWith(github.ref, 'refs/tags/')
+              uses: actions/upload-artifact@v7
               with:
-                  files: |
-                      dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip
-                      RELEASE.md
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  name: dcli-windows-msvc
+                  path: dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip
+                  if-no-files-found: error
 
     build-mac-x86_64:
-        runs-on: macos-11
+        needs: validate-host
+        runs-on: macos-15-intel
         steps:
             #set some environement variables that we can use through the rest of our
             #action
             - name: Setup Config
               id: config
               run: |
-                  echo ::set-output name=SOURCE_TAG::${GITHUB_REF/refs\/tags\//}
-                  echo ::set-output name=TARGET_NAME::x86_64-apple-darwin
+                  echo "SOURCE_TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+                  echo "TARGET_NAME=x86_64-apple-darwin" >> "$GITHUB_OUTPUT"
 
-            - uses: actions/checkout@v2
-            - uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: stable
-                  target: ${{ steps.config.outputs.TARGET_NAME }}
-                  override: true
-            - name: Build
-              uses: actions-rs/cargo@v1
+            - uses: actions/checkout@v4
+            - name: Require release key
+              if: startsWith(github.ref, 'refs/tags/')
               env:
                   DESTINY_API_KEY: ${{ secrets.DESTINY_API_KEY }}
-              with:
-                  use-cross: true
-                  command: build
-                  args: --manifest-path=src/Cargo.toml --release --target ${{ steps.config.outputs.TARGET_NAME }}
+              run: test -n "$DESTINY_API_KEY" || { echo 'DESTINY_API_KEY is required for tagged releases' >&2; exit 1; }
+            - name: Install Rust 1.83.0
+              run: rustup toolchain install 1.83.0 --profile minimal --target x86_64-apple-darwin
+            - name: Build validation binaries
+              if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+              env:
+                  DESTINY_API_KEY: validation-only-key
+              run: cargo +1.83.0 build --bins --locked --manifest-path=src/Cargo.toml --release --target x86_64-apple-darwin
+            - name: Build release binaries
+              if: startsWith(github.ref, 'refs/tags/')
+              env:
+                  DESTINY_API_KEY: ${{ secrets.DESTINY_API_KEY }}
+              run: cargo +1.83.0 build --bins --locked --manifest-path=src/Cargo.toml --release --target x86_64-apple-darwin
             - name: Process
-              if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+              if: startsWith(github.ref, 'refs/tags/')
               env:
                   SOURCE_TAG: ${{ steps.config.outputs.SOURCE_TAG }}
                   TARGET_NAME: ${{ steps.config.outputs.TARGET_NAME }}
-                  DESTINY_API_KEY: ${{ secrets.DESTINY_API_KEY }}
-              run: rustup toolchain install 1.65.0 && rustup override set 1.65.0 && echo SOURCE_TAG ${SOURCE_TAG} && cp src/target/${TARGET_NAME}/release/dclia . && strip dclia && cp src/target/${TARGET_NAME}/release/dcliad . && strip dcliad && cp src/target/${TARGET_NAME}/release/dclim . && strip dclim && cp src/target/${TARGET_NAME}/release/dclitime . && strip dclitime && cp src/target/${TARGET_NAME}/release/dcliah . && strip dcliah && cp src/target/${TARGET_NAME}/release/dclisync . && strip dclisync && cp src/target/${TARGET_NAME}/release/dclistat . && strip dclistat && zip -j dcli_${TARGET_NAME}_${SOURCE_TAG}.zip RELEASE.md README.md LICENSE.md dclia dcliad dclim dclitime dcliah dclisync dclistat
+              run: echo SOURCE_TAG ${SOURCE_TAG} && cp src/target/${TARGET_NAME}/release/dclia . && strip dclia && cp src/target/${TARGET_NAME}/release/dcliad . && strip dcliad && cp src/target/${TARGET_NAME}/release/dclim . && strip dclim && cp src/target/${TARGET_NAME}/release/dclitime . && strip dclitime && cp src/target/${TARGET_NAME}/release/dcliah . && strip dcliah && cp src/target/${TARGET_NAME}/release/dclisync . && strip dclisync && cp src/target/${TARGET_NAME}/release/dclistat . && strip dclistat && zip -j dcli_${TARGET_NAME}_${SOURCE_TAG}.zip RELEASE.md README.md LICENSE.md dclia dcliad dclim dclitime dcliah dclisync dclistat
 
-            - name: Release
-              uses: softprops/action-gh-release@v1
+            - name: Upload release package
               if: startsWith(github.ref, 'refs/tags/')
+              uses: actions/upload-artifact@v7
               with:
+                  name: dcli-mac-x86_64
+                  path: dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip
+                  if-no-files-found: error
+
+    publish-release:
+        needs:
+            - build-linux-musl
+            - build-windows-msvc
+            - build-mac-x86_64
+        if: startsWith(github.ref, 'refs/tags/')
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/download-artifact@v8
+              with:
+                  name: dcli-linux-musl
+                  path: release-assets/linux
+            - uses: actions/download-artifact@v8
+              with:
+                  name: dcli-windows-msvc
+                  path: release-assets/windows
+            - uses: actions/download-artifact@v8
+              with:
+                  name: dcli-mac-x86_64
+                  path: release-assets/macos
+            - name: Publish tagged release
+              uses: softprops/action-gh-release@v3
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
                   files: |
-                      dcli_${{ steps.config.outputs.TARGET_NAME }}_${{ steps.config.outputs.SOURCE_TAG }}.zip
+                      release-assets/linux/*.zip
+                      release-assets/windows/*.zip
+                      release-assets/macos/*.zip
                       RELEASE.md
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

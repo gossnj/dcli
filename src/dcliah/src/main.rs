@@ -555,7 +555,7 @@ fn print_default(
 }
 
 #[derive(Parser, Debug)]
-#[command(about, verbatim_doc_comment)]
+#[command(about, verbatim_doc_comment, version)]
 /// Command line tool for retrieving and viewing Destiny 2 Crucible activity history.
 ///
 /// Enables control of which stats are displayed based on game mode, moment range

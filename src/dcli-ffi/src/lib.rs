@@ -20,7 +20,6 @@
 * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-// Android JNI bindings
 #[cfg(target_os = "android")]
 mod android;
 
@@ -29,11 +28,7 @@ use log::{debug, error, info};
 #[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 use log::LevelFilter;
 
-// ============================================================================
-// Platform-specific logging initialization
-// ============================================================================
 
-// Apple platforms (iOS/macOS) - use OSLog
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use oslog::OsLogger;
 
@@ -46,13 +41,12 @@ fn init_platform_logging() {
     INIT.call_once(|| {
         OsLogger::new("com.ottercreeksoftware.Last-Banner.dcli")
             .level_filter(LevelFilter::Debug)
-            .category_level_filter("sqlx", LevelFilter::Warn) // Silence sqlx query spam
+            .category_level_filter("sqlx", LevelFilter::Warn)
             .init()
-            .ok(); // Ignore errors if already initialized
+            .ok();
     });
 }
 
-// Android - use android_logger
 #[cfg(target_os = "android")]
 use android_logger::{Config, FilterBuilder};
 
@@ -66,21 +60,19 @@ fn init_platform_logging() {
             .with_tag("dcli_ffi")
             .with_filter(
                 FilterBuilder::new()
-                    .filter(Some("sqlx"), LevelFilter::Warn) // Silence sqlx query spam
+                    .filter(Some("sqlx"), LevelFilter::Warn)
                     .filter(Some("dcli_ffi"), LevelFilter::Debug)
                     .build(),
             ),
     );
 }
 
-// Other platforms - no-op
 #[cfg(not(any(
     target_os = "ios",
     target_os = "macos",
     target_os = "android"
 )))]
 fn init_platform_logging() {
-    // No-op on other platforms
 }
 
 use chrono::{Duration, Utc};
@@ -202,15 +194,12 @@ pub extern "C" fn dcli_search_player(
         }
     };
 
-    // Parse the Bungie name
     let player_name = PlayerName::from_bungie_name(name_str);
 
-    // Validate it's a proper Bungie name
     if !player_name.is_valid_bungie_name() {
         return false;
     }
 
-    // Call the API
     let result = client.runtime.block_on(async {
         client.client.search_destiny_player(&player_name).await
     });
@@ -339,7 +328,6 @@ pub extern "C" fn dcli_get_characters(
     }
 }
 
-// MARK: - Activity Store Interface
 
 /// Opaque pointer to ActivityStoreInterface
 pub struct DcliActivityStore {
@@ -348,8 +336,8 @@ pub struct DcliActivityStore {
     runtime: tokio::runtime::Runtime,
 }
 
-/// Progress callback type for sync operations
-/// Parameters: message (const char*), current (u32), total (u32), user_data (void*)
+/// Receives sync progress. The message is valid only during the callback.
+/// user_data is passed through unchanged.
 pub type ProgressCallback =
     extern "C" fn(*const c_char, u32, u32, *mut std::ffi::c_void);
 
@@ -472,7 +460,6 @@ fn store_init_impl(
         }
     };
 
-    // Initialize store and manifest
     let result = runtime.block_on(async {
         let store = ActivityStoreInterface::init_with_path_recording(
             &dir,
@@ -626,9 +613,8 @@ pub extern "C" fn dcli_store_remove_player(
     }
 }
 
-/// Syncs a player's activities from the API by Bungie name
-/// Returns true on success, false on error
-/// Optionally accepts a progress callback for progress updates
+/// Syncs a player's activities from the API by Bungie name.
+/// Returns true on success, false on error.
 #[no_mangle]
 pub extern "C" fn dcli_store_sync_player(
     store: *mut DcliActivityStore,
@@ -669,7 +655,6 @@ pub extern "C" fn dcli_store_sync_player_with_progress(
         return false;
     }
 
-    // Helper to send progress updates from SyncProgress enum
     let send_progress = move |progress: SyncProgress| {
         if let Some(cb) = callback {
             let message = match &progress {
@@ -807,9 +792,8 @@ pub extern "C" fn dcli_store_backfill_scoreboard_values_with_progress(
     }
 }
 
-/// Gets Crucible stats from the local database for a character
-/// Uses the `all_time` time period
-/// Returns true on success, false on error
+/// Gets local Crucible stats for a character over the past ten years.
+/// Returns true on success, false on error.
 #[no_mangle]
 pub extern "C" fn dcli_store_get_crucible_stats(
     store: *mut DcliActivityStore,
@@ -853,14 +837,13 @@ pub extern "C" fn dcli_store_get_crucible_stats(
         let store_ref = &mut (*store_ptr).store;
 
         runtime.block_on(async {
-            // First find the member in the database
             let member = match store_ref.find_member(&player_name, false).await
             {
                 Ok(m) => m,
                 Err(_) => return None,
             };
 
-            // Get the all-time time period (past 10 years)
+            // Local summaries cover the past ten years.
             let time_period = match DateTimePeriod::with_start_end_time(
                 Utc::now() - Duration::days(3650),
                 Utc::now(),
@@ -869,7 +852,6 @@ pub extern "C" fn dcli_store_get_crucible_stats(
                 Err(_) => return None,
             };
 
-            // Query the database for activity summary
             let summary = match store_ref
                 .retrieve_activities_summary(
                     &member,
@@ -883,7 +865,6 @@ pub extern "C" fn dcli_store_get_crucible_stats(
                 _ => return None,
             };
 
-            // Convert PlayerActivitiesSummary to DcliCrucibleStats
             let total_activities = summary.total_activities as f32;
             let wins = summary.wins as f32;
             let losses = (summary.total_activities - summary.wins) as f32;
@@ -906,7 +887,7 @@ pub extern "C" fn dcli_store_get_crucible_stats(
                 kills + assists
             };
 
-            // Calculate average kill distance - not available in summary, so we estimate
+            // Kill distance is unavailable in stored summaries; report zero.
             let avg_kill_distance = 0.0;
             let avg_lifespan =
                 if deaths > 0.0 && summary.time_played_seconds > 0 {
@@ -946,13 +927,11 @@ pub extern "C" fn dcli_store_get_crucible_stats(
     }
 }
 
-// MARK: - Manifest Management
 
 use dcli::apiclient::ApiClient;
 use dcli::response::manifest::ManifestResponse;
 use std::fs;
 
-/// Manifest info structure returned to Swift
 #[repr(C)]
 pub struct DcliManifestInfo {
     pub version_len: usize,
@@ -961,8 +940,8 @@ pub struct DcliManifestInfo {
     pub url_ptr: *mut c_char,
 }
 
-/// Checks if a manifest needs updating
-/// Returns true if update needed, false otherwise
+/// Checks manifest freshness and writes it to out_needs_update.
+/// Returns true on success, false on error.
 #[no_mangle]
 pub extern "C" fn dcli_manifest_needs_update(
     data_dir: *const c_char,
@@ -985,7 +964,6 @@ pub extern "C" fn dcli_manifest_needs_update(
     };
 
     let result = runtime.block_on(async {
-        // Get remote manifest info
         let client = match ApiClient::new() {
             Ok(c) => c,
             Err(_) => return None,
@@ -1005,7 +983,6 @@ pub extern "C" fn dcli_manifest_needs_update(
 
         let remote_url = &manifest.mobile_world_content_paths.en;
 
-        // Check if local manifest exists and matches
         let manifest_path = dir.join("manifest.sqlite3");
         let manifest_info_path = dir.join("manifest_info.json");
 
@@ -1013,13 +990,11 @@ pub extern "C" fn dcli_manifest_needs_update(
             return Some(true);
         }
 
-        // Read local manifest info
         let json = match fs::read_to_string(&manifest_info_path) {
             Ok(j) => j,
             Err(_) => return Some(true),
         };
 
-        // Parse JSON to get local URL
         let local_info: serde_json::Value = match serde_json::from_str(&json) {
             Ok(v) => v,
             Err(_) => return Some(true),
@@ -1030,7 +1005,6 @@ pub extern "C" fn dcli_manifest_needs_update(
             _ => return Some(true),
         };
 
-        // Compare URLs
         Some(local_url != remote_url)
     });
 
@@ -1045,7 +1019,7 @@ pub extern "C" fn dcli_manifest_needs_update(
     }
 }
 
-/// Timeout for manifest downloads (2 minutes) - manifest is ~100MB compressed
+/// Large compressed manifests need a longer download timeout.
 const MANIFEST_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 
 /// Downloads and installs the manifest
@@ -1075,7 +1049,6 @@ pub extern "C" fn dcli_manifest_download(
         }
     };
 
-    // Ensure directory exists
     if let Err(_) = fs::create_dir_all(&dir) {
         return false;
     }
@@ -1086,7 +1059,7 @@ pub extern "C" fn dcli_manifest_download(
     };
 
     let result = runtime.block_on(async {
-        // Get manifest info from API (use standard client for quick API call)
+        // Metadata requests use the standard API timeout.
         debug!("Creating API client...");
         let client = match ApiClient::new_with_key(key) {
             Ok(c) => c,
@@ -1146,7 +1119,6 @@ pub extern "C" fn dcli_manifest_download(
             }
         };
 
-        // Download the manifest zip file
         let mut download_response =
             match download_client.get(&download_url).send().await {
                 Ok(r) => r,
@@ -1169,7 +1141,6 @@ pub extern "C" fn dcli_manifest_download(
         }
         debug!("Downloaded {} bytes", out.len());
 
-        // Unzip the manifest
         debug!("Unzipping manifest...");
         let cursor = std::io::Cursor::new(out);
         let mut zip = match zip::ZipArchive::new(cursor) {
@@ -1203,7 +1174,6 @@ pub extern "C" fn dcli_manifest_download(
             return false;
         }
 
-        // Save manifest info
         let info_json = format!(
             r#"{{"version":"{}","url":"{}"}}"#,
             version, manifest.mobile_world_content_paths.en
@@ -1223,7 +1193,7 @@ pub extern "C" fn dcli_manifest_download(
     result
 }
 
-/// Creates a string that can be freed with dcli_string_free
+/// Frees a string returned by dcli. Null is a no-op.
 #[no_mangle]
 pub extern "C" fn dcli_string_free(s: *mut c_char) {
     if !s.is_null() {
@@ -1233,11 +1203,8 @@ pub extern "C" fn dcli_string_free(s: *mut c_char) {
     }
 }
 
-/// Gets the last error message
-/// Returns null if no error
-/// Caller must free the returned string with dcli_string_free
+/// Compatibility stub: always returns null. Use per-call initialization diagnostics.
 #[no_mangle]
 pub extern "C" fn dcli_get_last_error() -> *mut c_char {
-    // For now, return null. In the future, we could store the last error in thread-local storage
     std::ptr::null_mut()
 }

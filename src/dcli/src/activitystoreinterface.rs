@@ -85,8 +85,7 @@ const STORE_DB_SCHEMA: &str = include_str!("../actitvity_store_schema.sql");
 
 const DCLI_FIX_DATA: &str = "DCLI_FIX_DATA";
 
-//number of simultaneous requests we make to server when retrieving activity history
-//Reduced from 100 to 25 to avoid Bungie API rate limiting
+// Limit concurrent requests to avoid Bungie API rate limiting.
 const PGCR_REQUEST_CHUNK_AMOUNT: usize = 25;
 
 const DB_SCHEMA_VERSION: i32 = 10;
@@ -598,7 +597,6 @@ impl ActivityStoreInterface {
             }
         };
 
-        // Delete from sync table first
         sqlx::query(
             r#"
             delete from "sync" where member = ?
@@ -748,7 +746,6 @@ impl ActivityStoreInterface {
         })
     }
 
-    /// Sync member with progress reporting callback.
     async fn sync_member_with_progress<F>(
         &mut self,
         member: &Member,
@@ -829,7 +826,6 @@ impl ActivityStoreInterface {
     where
         F: Fn(SyncProgress),
     {
-        // Find activity_ids that are post-scoreboardValues but have no data
         let mut ids: Vec<i64> = Vec::new();
         {
             let mut rows = sqlx::query(
@@ -896,7 +892,6 @@ impl ActivityStoreInterface {
                             let mut had_scoreboard_data = false;
 
                             for entry in &pgcr.entries {
-                                // Look up the character_activity_stats id
                                 let cas_row = sqlx::query(
                                     r#"SELECT "id" FROM "character_activity_stats" WHERE activity = ? AND character = ?"#,
                                 )
@@ -1088,7 +1083,6 @@ impl ActivityStoreInterface {
 
             let results = futures::future::join_all(f).await;
 
-            // Collect successful PGCR fetches for batch insert
             let mut activities_to_insert: Vec<
                 DestinyPostGameCarnageReportData,
             > = Vec::with_capacity(results.len());
@@ -1223,7 +1217,6 @@ impl ActivityStoreInterface {
         let mut downloaded_count: u32 = 0;
 
         for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
-            // Report downloading progress
             on_progress(SyncProgress::DownloadingActivities {
                 current: downloaded_count,
                 total: total_available,
@@ -1260,9 +1253,7 @@ impl ActivityStoreInterface {
                 }
             }
 
-            // Report saving progress
-            // Use match instead of ? to prevent early return on batch errors
-            // Failed activities remain in queue for retry on next sync
+            // Failed activities remain queued for retry; batch errors must not return early.
             if !activities_to_insert.is_empty() {
                 on_progress(SyncProgress::SavingActivities {
                     current: total_synced,
@@ -1397,7 +1388,6 @@ impl ActivityStoreInterface {
         //reverse them so we add the oldest first
         activities.reverse();
 
-        // DEBUG: Count queue size before insert
         let queue_before: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
         )
@@ -1465,7 +1455,6 @@ impl ActivityStoreInterface {
         }
         sqlx::query("COMMIT;").execute(&mut self.db).await?;
 
-        // DEBUG: Count queue size after insert
         let queue_after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
         )
@@ -1714,25 +1703,6 @@ impl ActivityStoreInterface {
             || activity.activity_details.director_activity_hash
                 == COMPETITIVE_PVP_ACTIVITY_HASH_S25
         {
-            /*
-                out.activityDetails.addToModes(mode: Mode.competitive.rawValue);
-
-            if out.activityDetails.mode == Mode.zoneControl.rawValue {
-                out.activityDetails.setMode(mode: Mode.competitiveCollision.rawValue)
-
-                //fix generic activity hash set (competitive)
-                out.activityDetails.setDirectorActivityHash(hash: collisionActivityHash)
-            }
-
-            if out.activityDetails.mode == Mode.clashQuickplay.rawValue {
-                out.activityDetails.removeFromModes(mode: Mode.clashQuickplay.rawValue)
-                out.activityDetails.removeFromModes(mode: Mode.quickplay.rawValue)
-                out.activityDetails.setMode(mode: Mode.competitiveClash.rawValue)
-
-                //fix generic activity hash set (competitive)
-                out.activityDetails.setDirectorActivityHash(hash: clashActivityHash)
-            }
-             */
 
             if activity.activity_details.mode == Mode::ZoneControl {
                 self.set_mode(activity, Mode::CollisionCompetitive);
@@ -1837,10 +1807,8 @@ impl ActivityStoreInterface {
             was_updated = self.fix_private_match(activity);
         }
 
-        // CRITICAL FIX: Ensure parent modes are present for proper stats querying
-        // The Bungie API returns activities when querying by mode (e.g., AllPvP=5),
-        // but the PGCR's modes array may not include that parent mode.
-        // This causes activities to be synced but not counted in stats queries.
+        // PGCRs may omit the parent mode used by the history API. Add it so
+        // synced activities remain visible to parent-mode stats queries.
 
         let has_all_pvp = activity
             .activity_details
@@ -1849,9 +1817,8 @@ impl ActivityStoreInterface {
             .any(|m| *m == Mode::AllPvP);
         let is_private = activity.activity_details.is_private;
 
-        // Add AllPvP (mode 5) to all non-private Crucible activities that don't have it
+        // Add AllPvP to public Crucible activities when absent.
         if !has_all_pvp && !is_private {
-            // Use canonical is_crucible() to detect PvP activities
             let is_pvp_activity = activity
                 .activity_details
                 .modes
@@ -1927,7 +1894,6 @@ impl ActivityStoreInterface {
 
         //TODO: Rumble will have no teams. Need to create one
 
-        // DEBUG: Check if AllPvP (5) or PrivateMatchesAll (32) are in modes
         let has_all_pvp = data
             .activity_details
             .modes
@@ -1945,7 +1911,7 @@ impl ActivityStoreInterface {
             .map(|m| m.as_id())
             .collect();
 
-        // Only log first few to avoid spam - log if missing expected parent modes
+        // Limit diagnostics to the first few entries or missing parent modes.
         if !has_all_pvp && !has_private_all {
             tell::update!("DEBUG: Activity {} has NO parent mode (AllPvP or PrivateMatchesAll). Modes: {:?}",
                 activity_id, mode_ids);
@@ -2097,7 +2063,6 @@ impl ActivityStoreInterface {
 
         let character_activity_stats_id: i32 = row.try_get("id")?;
 
-        // Bulk insert medals using QueryBuilder for better performance
         if !medal_hash.is_empty() {
             let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "main"."medal_result" ("reference_id", "count", "character_activity_stats") "#,
@@ -2115,7 +2080,6 @@ impl ActivityStoreInterface {
             query_builder.build().execute(&mut self.db).await?;
         }
 
-        // Bulk insert weapons using QueryBuilder for better performance
         if entry.extended.is_some() {
             let extended = char_data.extended.as_ref().unwrap();
             if let Some(weapons) = &extended.weapons {
@@ -2147,7 +2111,6 @@ impl ActivityStoreInterface {
             }
         }
 
-        // Bulk insert scoreboard values using QueryBuilder
         if let Some(extended) = &char_data.extended {
             if let Some(scoreboard) = &extended.scoreboard_values {
                 if !scoreboard.is_empty() {
@@ -2347,7 +2310,6 @@ impl ActivityStoreInterface {
         character_id: &i64,
         mode: &Mode,
     ) -> Result<i64, Error> {
-        // DEBUG: Count activities in queue for this character
         let queue_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
         )
@@ -2356,7 +2318,6 @@ impl ActivityStoreInterface {
         .await
         .unwrap_or(0);
 
-        // DEBUG: Count synced activities for this character
         let synced_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM activity_queue WHERE character = ? AND synced = 1"
         )
@@ -2365,7 +2326,6 @@ impl ActivityStoreInterface {
         .await
         .unwrap_or(0);
 
-        // DEBUG: Count activities with this specific mode
         let mode_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(DISTINCT modes.activity)
@@ -3232,13 +3192,11 @@ impl std::ops::Add<SyncResult> for SyncResult {
     }
 }
 
-/// Progress updates during sync operations.
-/// Designed to provide granular feedback for mobile apps.
+/// Progress events for mobile sync feedback.
 #[derive(Debug, Clone)]
 pub enum SyncProgress {
     /// Starting sync for a player
     Starting,
-    /// Fetching activity history for a character
     FetchingHistory {
         character_index: u8,
         character_count: u8,
@@ -3246,11 +3204,8 @@ pub enum SyncProgress {
     },
     /// Downloading activity details (PGCRs)
     DownloadingActivities { current: u32, total: u32 },
-    /// Saving activities to database
     SavingActivities { current: u32, total: u32 },
-    /// Sync completed successfully
     Complete { total_synced: u32 },
-    /// Sync failed with error
     Failed { message: String },
 }
 
@@ -3264,7 +3219,6 @@ impl SyncProgress {
                 character_count,
                 class_name,
             } => {
-                // We'll return static str, caller can format if needed
                 let _ = (character_index, character_count, class_name);
                 ("Fetching activity history...", 0, 100)
             }

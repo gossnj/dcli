@@ -109,7 +109,7 @@ fn print_default(data: &PlayerActivitiesSummary, stats: &[Stat]) {
 }
 
 #[derive(Parser, Debug)]
-#[command(about, verbatim_doc_comment)]
+#[command(about, verbatim_doc_comment, version)]
 /// Command line tool for retrieving and viewing Destiny 2 Crucible activity history.
 ///
 /// Enables control of which stats are displayed based on game mode, moment range
@@ -233,7 +233,7 @@ struct Opt {
     /// assists, kills_avg, opponents_defeated_avg, deaths_avg, assists_avg,
     /// kd_max, kda_max, efficiency_max, kills_max, opponents_defeated_max,
     /// deaths_max, games, wins, losses, mercies.
-    #[arg(short = 'x', long = "stat")]
+    #[arg(short = 'x', long = "stat", num_args = 1.., required = true)]
     stat: Vec<Stat>,
 
     ///Print out additional information
@@ -370,3 +370,6 @@ async fn main() {
 
     print_default(&data, &opt.stat);
 }
+
+#[cfg(test)]
+mod cli_contract;

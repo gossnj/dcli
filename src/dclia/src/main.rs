@@ -42,7 +42,7 @@ use dcli::utils::{format_error, EXIT_FAILURE};
 const ORBIT_PLACE_HASH: u32 = 2961497387;
 
 #[derive(Parser, Debug)]
-#[command(about, verbatim_doc_comment)]
+#[command(about, verbatim_doc_comment, version)]
 /// Command line tool for retrieving current Destiny 2 activity status for player.
 ///
 /// Created by Mike Chambers.
