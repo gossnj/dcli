@@ -11,7 +11,7 @@ python3 tests/test_native_abi.py src/target/debug/libdcli_ffi.so
 python3 tests/native_init_diagnostics.py src/target/debug/libdcli_ffi.so
 ```
 
-On macOS, pass `src/target/debug/libdcli_ffi.dylib` to both native-library checks. `test_cli_smoke.py` expects the seven debug executables produced by the workspace build. The build-script checks use temporary stub tools to verify missing-key and environment-key handling; they do not package or copy libraries. Native ABI checks compile and link a C contract against both public headers, while initialization diagnostics exercise the built FFI library.
+On macOS, pass `src/target/debug/libdcli_ffi.dylib` to both native-library checks. `test_cli_smoke.py` expects the seven debug executables produced by the workspace build. The build-script checks use temporary stub tools to verify missing-key handling, key forwarding without logging, and installation of all four Android targets on the pinned Rust toolchain before the build; they do not package or copy libraries. Native ABI checks compile and link a C contract against both public headers, while initialization diagnostics exercise the built FFI library.
 
 The `runapps` and `runapps.bat` scripts provide a manual smoke run of installed command-line tools found on `PATH`.
 

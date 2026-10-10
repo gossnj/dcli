@@ -9,6 +9,11 @@ echo "🔨 Building dcli FFI for Android..."
 # Pin Rust for reproducible builds.
 export RUSTUP_TOOLCHAIN="1.83.0"
 rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+rustup target add --toolchain "$RUSTUP_TOOLCHAIN" \
+    aarch64-linux-android \
+    armv7-linux-androideabi \
+    x86_64-linux-android \
+    i686-linux-android
 
 # Build for all Android architectures
 # Output directly to the Android project's jniLibs directory

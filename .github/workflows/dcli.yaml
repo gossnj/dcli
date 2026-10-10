@@ -69,7 +69,7 @@ jobs:
                   mkdir -p "$source_dir"
                   tar --extract --gzip --file "$archive" --directory "$source_dir" --strip-components=1
                   cd "$source_dir"
-                  CC=musl-gcc ./Configure linux-x86_64 no-shared no-tests --prefix="$install_dir" --openssldir="$install_dir/ssl"
+                  CC=musl-gcc ./Configure linux-x86_64 no-shared no-tests no-afalgeng -DOPENSSL_NO_SECURE_MEMORY --prefix="$install_dir" --openssldir="$install_dir/ssl"
                   make --jobs="$(nproc)"
                   make install_sw
                   echo "OPENSSL_DIR=$install_dir" >> "$GITHUB_ENV"
