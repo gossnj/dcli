@@ -19,6 +19,9 @@ class BuildScriptKeyTests(unittest.TestCase):
             shutil.copyfile(ROOT / "src/dcli-ffi" / script_name, script)
             tools = root / "tools"
             tools.mkdir()
+            cargo_env = root / ".cargo"
+            cargo_env.mkdir()
+            (cargo_env / "env").write_text("")
             marker = root / "invoked"
             # Stop at the first tool boundary; no test library can reach a consumer.
             stub = '#!/bin/sh\n[ "$DESTINY_API_KEY" = "validation-only-key" ] && printf expected > "$BUILD_TEST_MARKER" || printf unexpected > "$BUILD_TEST_MARKER"\nexit 73\n'
@@ -28,9 +31,11 @@ class BuildScriptKeyTests(unittest.TestCase):
                 path.chmod(0o755)
             env = os.environ.copy()
             env.pop("DESTINY_API_KEY", None)
+            env.pop("BASH_ENV", None)
             if key is not None:
                 env["DESTINY_API_KEY"] = key
-            env["PATH"] = os.pathsep.join((str(tools), str(Path.home() / ".cargo/bin"), env["PATH"]))
+            env["HOME"] = str(root)
+            env["PATH"] = os.pathsep.join((str(tools), os.defpath))
             env["BUILD_TEST_MARKER"] = str(marker)
             env["BUILD_TEST_TARGETS"] = str(root / "installed-targets")
             result = subprocess.run(["/bin/bash", str(script)], cwd=root, env=env,
