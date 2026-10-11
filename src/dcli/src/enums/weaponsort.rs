@@ -23,7 +23,7 @@
 //use std::fmt;
 use std::str::FromStr;
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub enum WeaponSort {
     Name,
     Kills,

@@ -30,6 +30,7 @@ pub mod cruciblestats;
 pub mod emblem;
 pub mod enums;
 pub mod error;
+pub mod initializationdiagnostics;
 pub mod manifest;
 pub mod manifestinterface;
 pub mod output;

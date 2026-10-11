@@ -101,7 +101,7 @@ impl ApiClient {
             let limit = std::cmp::min(len, MAX);
 
             debug!("Response body : {}", body);
-            let string: String = body.chars().take(limit).skip(0).collect();
+            let string: String = body.chars().take(limit).collect();
             tell::verbose!(
                 "---------Begin API response : First {}  chars---------",
                 limit

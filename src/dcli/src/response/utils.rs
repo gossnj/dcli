@@ -210,7 +210,7 @@ where
         }
     };
 
-    let dt = DateTime::<Utc>::from_utc(n, Utc);
+    let dt = n.and_utc();
 
     Ok(dt)
 }

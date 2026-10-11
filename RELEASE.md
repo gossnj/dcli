@@ -1,5 +1,12 @@
 # dcli Release Notes
 
+## Unreleased
+
+- Restored `--version` for all seven command-line applications. `dclisync` accepts multiple player names for sync, add, and remove operations, and `dclistat` requires one or more `--stat` values.
+- Standardized workspace and platform builds on Rust 1.83.0 with the checked-in lockfile, and made `DESTINY_API_KEY` an explicit build input.
+- Added host validation for Rust data-layer and parser tests, CLI smoke checks, build-script guard checks, native initialization diagnostics, and C header compile/link contracts.
+- Added progress callback declarations to both native FFI headers. The tracked native archives remain historical artifacts; rebuild from source before using current initialization-diagnostics or store-close APIs.
+
 ## v0.99.9 November 12, 2024
 
 -   Fix API issues for competitive matches.

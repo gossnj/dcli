@@ -77,6 +77,13 @@ pub enum Moment {
     SeasonOfTheDeep,
     SeasonOfTheWitch,
     SeasonOfTheWish,
+    TheFinalShape,
+    EpisodeEchoes,
+    EpisodeRevenant,
+    EpisodeHeresy,
+    EdgeOfFate,
+    Renegades,
+    AshAndIron,
 }
 
 impl Moment {
@@ -181,6 +188,34 @@ impl Moment {
             Moment::SeasonOfTheWish => {
                 Utc.with_ymd_and_hms(2023, 11, 28, 17, 0, 0).unwrap()
             }
+
+            Moment::TheFinalShape => {
+                Utc.with_ymd_and_hms(2024, 6, 4, 17, 0, 0).unwrap()
+            }
+
+            Moment::EpisodeEchoes => {
+                Utc.with_ymd_and_hms(2024, 6, 11, 17, 0, 0).unwrap()
+            }
+
+            Moment::EpisodeRevenant => {
+                Utc.with_ymd_and_hms(2024, 10, 8, 17, 0, 0).unwrap()
+            }
+
+            Moment::EpisodeHeresy => {
+                Utc.with_ymd_and_hms(2025, 2, 4, 17, 0, 0).unwrap()
+            }
+
+            Moment::EdgeOfFate => {
+                Utc.with_ymd_and_hms(2025, 7, 8, 17, 0, 0).unwrap()
+            }
+
+            Moment::Renegades => {
+                Utc.with_ymd_and_hms(2025, 12, 9, 17, 0, 0).unwrap()
+            }
+
+            Moment::AshAndIron => {
+                Utc.with_ymd_and_hms(2026, 6, 9, 17, 0, 0).unwrap()
+            }
         }
     }
 }
@@ -235,6 +270,13 @@ impl FromStr for Moment {
             "season_of_the_deep" => Ok(Moment::SeasonOfTheDeep),
             "season_of_the_witch" => Ok(Moment::SeasonOfTheWitch),
             "season_of_the_wish" => Ok(Moment::SeasonOfTheWish),
+            "the_final_shape" => Ok(Moment::TheFinalShape),
+            "episode_echoes" => Ok(Moment::EpisodeEchoes),
+            "episode_revenant" => Ok(Moment::EpisodeRevenant),
+            "episode_heresy" => Ok(Moment::EpisodeHeresy),
+            "edge_of_fate" => Ok(Moment::EdgeOfFate),
+            "renegades" => Ok(Moment::Renegades),
+            "ash_and_iron" => Ok(Moment::AshAndIron),
 
             _ => Err("Unknown Moment type"),
         }
@@ -286,6 +328,13 @@ impl fmt::Display for Moment {
             Moment::SeasonOfTheDeep => "Season of the Deep",
             Moment::SeasonOfTheWitch => "Season of the Witch",
             Moment::SeasonOfTheWish => "Season of the Wish",
+            Moment::TheFinalShape => "The Final Shape",
+            Moment::EpisodeEchoes => "Episode: Echoes",
+            Moment::EpisodeRevenant => "Episode: Revenant",
+            Moment::EpisodeHeresy => "Episode: Heresy",
+            Moment::EdgeOfFate => "Edge of Fate",
+            Moment::Renegades => "Renegades",
+            Moment::AshAndIron => "Ash and Iron",
         };
 
         write!(f, "{}", out)
