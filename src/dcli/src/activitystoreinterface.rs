@@ -20,12 +20,9 @@
 * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
+use chrono::{DateTime, Utc};
 use std::str::FromStr;
 use std::{collections::HashMap, path::Path};
-use tell::{Tell, TellLevel};
-
-use chrono::{DateTime, Utc};
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 
 use crate::playeractivitiessummary::PlayerActivitiesSummary;
 use crate::utils::{
@@ -85,7 +82,7 @@ const STORE_DB_SCHEMA: &str = include_str!("../actitvity_store_schema.sql");
 
 const DCLI_FIX_DATA: &str = "DCLI_FIX_DATA";
 
-// Limit concurrent requests to avoid Bungie API rate limiting.
+// Scoreboard backfill requests share the transport's request budget.
 const PGCR_REQUEST_CHUNK_AMOUNT: usize = 25;
 
 const DB_SCHEMA_VERSION: i32 = 10;
@@ -115,6 +112,9 @@ const SCOREBOARD_VALUES_START_DATE: &str = "2025-08-19T00:00:00Z";
 
 #[cfg(test)]
 mod tests;
+
+mod sync;
+pub use sync::{SyncControl, SyncEvent, SyncOutcome, SyncPhase};
 
 pub struct ActivityStoreInterface {
     db: SqliteConnection,
@@ -297,6 +297,15 @@ impl ActivityStoreInterface {
             );
         }
         pending_index?;
+        sqlx::query("BEGIN TRANSACTION").execute(&mut db).await?;
+        let scan_migration = sqlx::query(sync::SYNC_SCAN_SCHEMA).execute(&mut db).await;
+        match scan_migration {
+            Ok(_) => { sqlx::query("COMMIT").execute(&mut db).await?; }
+            Err(error) => {
+                sqlx::query("ROLLBACK").execute(&mut db).await?;
+                return Err(error.into());
+            }
+        }
         let started = Instant::now();
         let team_index = sqlx::query(
             "CREATE INDEX IF NOT EXISTS team_result_activity_index \
@@ -487,6 +496,53 @@ impl ActivityStoreInterface {
         Ok(out)
     }
 
+    pub async fn sync_player_with_control<F>(
+        &mut self,
+        player_name: &PlayerName,
+        control: &SyncControl,
+        on_event: F,
+    ) -> Result<SyncOutcome, Error>
+    where
+        F: Fn(SyncEvent),
+    {
+        let outcome = SyncOutcome::default();
+        on_event(SyncEvent {
+            phase: SyncPhase::Starting,
+            outcome,
+        });
+        if control.is_cancelled() {
+            let outcome = SyncOutcome {
+                cancelled: true,
+                ..SyncOutcome::default()
+            };
+            on_event(SyncEvent {
+                phase: SyncPhase::Cancelled,
+                outcome,
+            });
+            return Ok(outcome);
+        }
+        let member = match sync::await_or_cancel(
+            control,
+            self.find_member(player_name, false),
+        )
+        .await
+        {
+            Some(result) => result?,
+            None => {
+                let outcome = SyncOutcome {
+                    cancelled: true,
+                    ..SyncOutcome::default()
+                };
+                on_event(SyncEvent {
+                    phase: SyncPhase::Cancelled,
+                    outcome,
+                });
+                return Ok(outcome);
+            }
+        };
+        self.sync_member_engine(&member, control, &on_event).await
+    }
+
     /// Sync a player with granular progress reporting.
     /// The callback is invoked at each major phase of the sync operation.
     pub async fn sync_player_with_progress<F>(
@@ -498,22 +554,27 @@ impl ActivityStoreInterface {
         F: Fn(SyncProgress),
     {
         on_progress(SyncProgress::Starting);
-
         let member = match self.find_member(player, false).await {
-            Ok(m) => m,
-            Err(e) => {
+            Ok(member) => member,
+            Err(error) => {
                 on_progress(SyncProgress::Failed {
-                    message: format!("{:?}", e),
+                    message: format!("{:?}", error),
                 });
-                return Err(e);
+                return Err(error);
             }
         };
-
         match self.sync_member_with_progress(&member, &on_progress).await {
-            Ok(result) => {
-                on_progress(SyncProgress::Complete {
-                    total_synced: result.total_synced,
-                });
+            Ok((result, complete)) => {
+                if complete {
+                    on_progress(SyncProgress::Complete {
+                        total_synced: result.total_synced,
+                    });
+                } else {
+                    on_progress(SyncProgress::Failed {
+                        message: "Sync incomplete; reports remain queued"
+                            .to_owned(),
+                    });
+                }
                 Ok(result)
             }
             Err(e) => {
@@ -637,11 +698,14 @@ impl ActivityStoreInterface {
             }
         };
 
-        match self.update_sync_entry(&member.id).await {
+        match sqlx::query("INSERT OR IGNORE INTO sync(member,last_sync) VALUES (?,'1970-01-01T00:00:00Z')")
+            .bind(member.id)
+            .execute(&mut self.db)
+            .await {
             Ok(e) => e,
             Err(e) => {
                 self.rollback_transaction().await?;
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -674,75 +738,12 @@ impl ActivityStoreInterface {
         &mut self,
         member: &Member,
     ) -> Result<SyncResult, Error> {
-        //Note, we need this call in case the user deletes and creates a new character
-        //https://www.bungie.net/Platform/Destiny2/1/Profile/4611686018429783292/?components=100,200
-        let player_info = self
-            .api_interface
-            .get_player_info(&member.id, &member.platform)
+        let outcome = self
+            .sync_member_engine(member, &SyncControl::new(), &|_| {})
             .await?;
-
-        //TODO: Check is core issue has been fixed
-        //Note, if this profile call fails, then we dont sync user. However, we could
-        //capture and then just sync the characters we already have.
-        //This issue is causing the sync to fail for some users:
-        //https://twitter.com/BungieHelp/status/1595515590160306176?s=20&t=QR7Rs7weMwzTfO2YtTArSg
-        //https://github.com/Bungie-net/api/issues/1738
-
-        let characters = player_info.characters;
-
-        self.insert_member(&player_info.user_info.to_member())
-            .await?;
-
-        let mut total_synced = 0;
-        let mut total_in_queue = 0;
-
-        tell::update!(
-            "CHECKING FOR NEW ACTIVITIES FOR {} (PUBLIC AND PRIVATE)",
-            member.name.get_bungie_name()
-        );
-        tell::progress!("This may take a few minutes depending on the number of activities.");
-
-        for char_info in characters.characters {
-            let character_id = &char_info.id;
-            self.insert_character(
-                &char_info.id,
-                &char_info.class_type,
-                &member,
-            )
-            .await?;
-            tell::progress!(
-                "{}",
-                format!("[{}]", char_info.class_type).to_uppercase()
-            );
-
-            //these calls could be a little more general purpose by taking api ids and not db ids.
-            //however, passing the db ids, lets us optimize a lot of the sql, and avoid
-            //some extra calls to the DB
-
-            let sync_result_a = self.sync_activities(character_id).await?;
-
-            let _queue_result = self
-                .update_activity_queue(
-                    &member.id,
-                    character_id,
-                    &member.platform,
-                )
-                .await?;
-
-            let sync_result_b = self.sync_activities(character_id).await?;
-
-            total_synced +=
-                sync_result_a.total_synced + sync_result_b.total_synced;
-            total_in_queue += (sync_result_a.total_available
-                + sync_result_b.total_available)
-                - (sync_result_a.total_synced + sync_result_b.total_synced);
-        }
-
-        self.update_sync_entry(&member.id).await?;
-
         Ok(SyncResult {
-            total_synced,
-            total_available: total_in_queue,
+            total_synced: outcome.committed,
+            total_available: outcome.pending + outcome.unavailable,
         })
     }
 
@@ -750,68 +751,37 @@ impl ActivityStoreInterface {
         &mut self,
         member: &Member,
         on_progress: &F,
-    ) -> Result<SyncResult, Error>
+    ) -> Result<(SyncResult, bool), Error>
     where
         F: Fn(SyncProgress),
     {
-        let player_info = self
-            .api_interface
-            .get_player_info(&member.id, &member.platform)
+        let outcome = self
+            .sync_member_engine(member, &SyncControl::new(), &|event| {
+                match event.phase {
+                    SyncPhase::Discovering => {
+                        on_progress(SyncProgress::FetchingHistory {
+                            character_index: 0,
+                            character_count: 0,
+                            class_name: String::new(),
+                        })
+                    }
+                    SyncPhase::Committed | SyncPhase::RecentReady => {
+                        on_progress(SyncProgress::SavingActivities {
+                            current: event.outcome.committed,
+                            total: event.outcome.discovered,
+                        })
+                    }
+                    _ => {}
+                }
+            })
             .await?;
-
-        let characters = player_info.characters;
-
-        self.insert_member(&player_info.user_info.to_member())
-            .await?;
-
-        let mut total_synced = 0;
-        let mut total_in_queue = 0;
-        let character_count = characters.characters.len() as u8;
-
-        tell::update!(
-            "CHECKING FOR NEW ACTIVITIES FOR {} (PUBLIC AND PRIVATE)",
-            member.name.get_bungie_name()
-        );
-
-        for (index, c) in characters.characters.iter().enumerate() {
-            let character_id = &c.id;
-            self.insert_character(&c.id, &c.class_type, member).await?;
-
-            on_progress(SyncProgress::FetchingHistory {
-                character_index: index as u8 + 1,
-                character_count,
-                class_name: format!("{}", c.class_type).to_uppercase(),
-            });
-
-            tell::progress!("{}", format!("[{}]", c.class_type).to_uppercase());
-
-            let a = self
-                .sync_activities_with_progress(character_id, on_progress)
-                .await?;
-
-            let _b = self
-                .update_activity_queue(
-                    &member.id,
-                    character_id,
-                    &member.platform,
-                )
-                .await?;
-
-            let c_result = self
-                .sync_activities_with_progress(character_id, on_progress)
-                .await?;
-
-            total_synced += a.total_synced + c_result.total_synced;
-            total_in_queue += (a.total_available + c_result.total_available)
-                - (a.total_synced + c_result.total_synced);
-        }
-
-        self.update_sync_entry(&member.id).await?;
-
-        Ok(SyncResult {
-            total_synced,
-            total_available: total_in_queue,
-        })
+        Ok((
+            SyncResult {
+                total_synced: outcome.committed,
+                total_available: outcome.pending + outcome.unavailable,
+            },
+            outcome.complete,
+        ))
     }
 
     /// Backfills scoreboard_result data for activities since Aug 2025 that are
@@ -997,150 +967,21 @@ impl ActivityStoreInterface {
         })
     }
 
-    /// download results from ids in queue, and return number of items synced
+    /// Download reports already queued for this character through the shared sync engine.
+    #[cfg(test)]
     async fn sync_activities(
         &mut self,
         character_id: &i64,
     ) -> Result<SyncResult, Error> {
-        let mut ids: Vec<i64> = Vec::new();
-
-        //This is to scope rows, so the mutable borrow of self goes out of scope
-        {
-            let mut rows = sqlx::query(
-                r#"
-                    SELECT
-                        "activity_id"
-                    FROM
-                        "activity_queue"
-                    WHERE
-                        character = ? AND synced = 0
-                    ORDER BY
-                        activity_id DESC
-                "#,
-            )
-            .bind(character_id)
-            .fetch(&mut self.db);
-
-            //todo: could probably get this without looping through entire set
-            while let Some(row) = rows.try_next().await? {
-                let activity_id: i64 = row.try_get("activity_id")?;
-                ids.push(activity_id);
-            }
-        };
-
-        if ids.is_empty() {
-            return Ok(SyncResult {
-                total_available: 0,
-                total_synced: 0,
-            });
-        }
-
-        let mut filtered_ids = Vec::new();
-
-        //remove ids to sync for activities we have already synced
-        for id in ids {
-            if self.has_activity(&id).await {
-                self.remove_from_activity_queue(character_id, &id).await?;
-                continue;
-            } else {
-                filtered_ids.push(id)
-            }
-        }
-        ids = filtered_ids;
-
-        let total_available = ids.len() as u32;
-        let mut total_synced = 0;
-
-        use std::fmt::Write;
-
-        let pb = if Tell::is_active(TellLevel::Progress) {
-            ProgressBar::new(ids.len() as u64)
-        } else {
-            ProgressBar::hidden()
-        };
-
-        pb.set_style(ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {human_pos}/{human_len} ETA:({eta_precise})")
-        .unwrap()
-        .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-        .progress_chars("#>-"));
-
-        let mut count: u64 = 0;
-        for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
-            let mut f = Vec::new();
-
-            for c in id_chunks {
-                //this is saving the future, call hasnt been made yet
-                f.push(
-                    self.api_interface.retrieve_post_game_carnage_report(*c),
-                );
-            }
-
-            count += id_chunks.len() as u64;
-            pb.set_position(count);
-
-            //tell::progress!(".");
-
-            let results = futures::future::join_all(f).await;
-
-            let mut activities_to_insert: Vec<
-                DestinyPostGameCarnageReportData,
-            > = Vec::with_capacity(results.len());
-
-            for r in results {
-                match r {
-                    Ok(Some(e)) => activities_to_insert.push(e),
-                    Ok(None) => {
-                        tell::error!("PGCR returned empty response. Ignoring.");
-                    }
-                    Err(_) => {
-                        tell::error!(
-                            "Error retrieving activity details from api. Skipping."
-                        );
-                    }
-                }
-            }
-
-            // Batch insert all fetched activities in a single transaction
-            // Use match instead of ? to prevent early return on batch errors
-            // Failed activities remain in queue for retry on next sync
-            if !activities_to_insert.is_empty() {
-                match self
-                    .insert_activities_batch(
-                        &mut activities_to_insert,
-                        character_id,
-                    )
-                    .await
-                {
-                    Ok(count) => total_synced += count,
-                    Err(e) => {
-                        tell::error!(
-                            "Error inserting activity batch for character {}. Continuing with next chunk: {}",
-                            character_id,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        pb.finish_and_clear();
-
-        if !ids.is_empty() {
-            if let Err(e) =
-                sqlx::query("PRAGMA OPTIMIZE;").execute(&mut self.db).await
-            {
-                tell::error!("PRAGMA OPTIMIZE failed: {}", e);
-            }
-        }
-
-        Ok(SyncResult {
-            total_available,
-            total_synced,
-        })
+        self.download_pending_for_character(
+            *character_id,
+            &SyncControl::new(),
+            &|_| {},
+        )
+        .await
     }
 
-    /// Download and sync activities with progress reporting
+    #[cfg(test)]
     async fn sync_activities_with_progress<F>(
         &mut self,
         character_id: &i64,
@@ -1149,178 +990,19 @@ impl ActivityStoreInterface {
     where
         F: Fn(SyncProgress),
     {
-        let mut ids: Vec<i64> = Vec::new();
-
-        {
-            let mut rows = sqlx::query(
-                r#"
-                    SELECT
-                        "activity_id"
-                    FROM
-                        "activity_queue"
-                    WHERE
-                        character = ? AND synced = 0
-                    ORDER BY
-                        activity_id DESC
-                "#,
-            )
-            .bind(character_id)
-            .fetch(&mut self.db);
-
-            while let Some(row) = rows.try_next().await? {
-                let activity_id: i64 = row.try_get("activity_id")?;
-                ids.push(activity_id);
-            }
-        };
-
-        if ids.is_empty() {
-            return Ok(SyncResult {
-                total_available: 0,
-                total_synced: 0,
-            });
-        }
-
-        let mut filtered_ids = Vec::new();
-
-        for id in ids {
-            if self.has_activity(&id).await {
-                self.remove_from_activity_queue(character_id, &id).await?;
-                continue;
-            } else {
-                filtered_ids.push(id)
-            }
-        }
-        ids = filtered_ids;
-
-        let total_available = ids.len() as u32;
-        let mut total_synced = 0;
-
-        use std::fmt::Write;
-
-        let pb = if Tell::is_active(TellLevel::Progress) {
-            ProgressBar::new(ids.len() as u64)
-        } else {
-            ProgressBar::hidden()
-        };
-
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {human_pos}/{human_len} ETA:({eta_precise})",
-            )
-            .unwrap()
-            .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
-                write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap()
-            })
-            .progress_chars("#>-"),
-        );
-
-        let mut downloaded_count: u32 = 0;
-
-        for id_chunks in ids.chunks(PGCR_REQUEST_CHUNK_AMOUNT) {
-            on_progress(SyncProgress::DownloadingActivities {
-                current: downloaded_count,
-                total: total_available,
-            });
-
-            let mut f = Vec::new();
-
-            for c in id_chunks {
-                f.push(
-                    self.api_interface.retrieve_post_game_carnage_report(*c),
-                );
-            }
-
-            downloaded_count += id_chunks.len() as u32;
-            pb.set_position(downloaded_count as u64);
-
-            let results = futures::future::join_all(f).await;
-
-            let mut activities_to_insert: Vec<
-                DestinyPostGameCarnageReportData,
-            > = Vec::with_capacity(results.len());
-
-            for r in results {
-                match r {
-                    Ok(Some(e)) => activities_to_insert.push(e),
-                    Ok(None) => {
-                        tell::error!("PGCR returned empty response. Ignoring.");
-                    }
-                    Err(_) => {
-                        tell::error!(
-                            "Error retrieving activity details from api. Skipping."
-                        );
-                    }
+        self.download_pending_for_character(
+            *character_id,
+            &SyncControl::new(),
+            &|event| {
+                if event.phase == SyncPhase::Committed {
+                    on_progress(SyncProgress::SavingActivities {
+                        current: event.outcome.committed,
+                        total: event.outcome.discovered,
+                    });
                 }
-            }
-
-            // Failed activities remain queued for retry; batch errors must not return early.
-            if !activities_to_insert.is_empty() {
-                on_progress(SyncProgress::SavingActivities {
-                    current: total_synced,
-                    total: total_available,
-                });
-
-                match self
-                    .insert_activities_batch(
-                        &mut activities_to_insert,
-                        character_id,
-                    )
-                    .await
-                {
-                    Ok(count) => total_synced += count,
-                    Err(e) => {
-                        tell::error!(
-                            "Error inserting activity batch for character {}. Continuing with next chunk: {}",
-                            character_id,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        pb.finish_and_clear();
-
-        if !ids.is_empty() {
-            if let Err(e) =
-                sqlx::query("PRAGMA OPTIMIZE;").execute(&mut self.db).await
-            {
-                tell::error!("PRAGMA OPTIMIZE failed: {}", e);
-            }
-        }
-
-        Ok(SyncResult {
-            total_available,
-            total_synced,
-        })
-    }
-
-    async fn update_activity_queue(
-        &mut self,
-        member_id: &i64,
-        character_id: &i64,
-        platform: &Platform,
-    ) -> Result<SyncResult, Error> {
-        //TODO catch errors so we can continue?
-        let prv_result = self
-            ._update_activity_queue(
-                member_id,
-                character_id,
-                platform,
-                &Mode::PrivateMatchesAll,
-            )
-            .await?;
-
-        let pub_result = self
-            ._update_activity_queue(
-                member_id,
-                character_id,
-                platform,
-                &Mode::AllPvP,
-            )
-            .await?;
-
-        Ok(pub_result + prv_result)
+            },
+        )
+        .await
     }
 
     async fn begin_transaction(&mut self) -> Result<(), Error> {
@@ -1341,136 +1023,6 @@ impl ActivityStoreInterface {
         sqlx::query("ROLLBACK;").execute(&mut self.db).await?;
 
         Ok(())
-    }
-
-    //updates activity id queue with ids which have not been synced
-    async fn _update_activity_queue(
-        &mut self,
-        member_id: &i64,
-        character_id: &i64,
-        platform: &Platform,
-        mode: &Mode,
-    ) -> Result<SyncResult, Error> {
-        let max_id: i64 = self.get_max_activity_id(character_id, mode).await?;
-        tell::update!(
-            "DEBUG: _update_activity_queue mode={:?} max_id={} character_id={}",
-            mode,
-            max_id,
-            character_id
-        );
-
-        let result = self
-            .api_interface
-            .retrieve_activities_since_id(
-                member_id,
-                character_id,
-                platform,
-                mode,
-                max_id,
-            )
-            .await?;
-
-        if result.is_none() {
-            tell::update!("DEBUG: No activities found for mode={:?}", mode);
-            return Ok(SyncResult {
-                total_available: 0,
-                total_synced: 0,
-            });
-        }
-
-        let mut activities = result.unwrap();
-        tell::update!(
-            "DEBUG: Found {} activities for mode={:?}",
-            activities.len(),
-            mode
-        );
-
-        //reverse them so we add the oldest first
-        activities.reverse();
-
-        let queue_before: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
-        )
-        .bind(character_id)
-        .fetch_one(&mut self.db)
-        .await
-        .unwrap_or(0);
-
-        // TODO: think through this
-        // Right now, we do all inserts in one transaction. This gives a significant performance
-        // increse when inserting large number of activities at one time (i.e. on first sync).
-        // however, it means if something goes wrong, nothing will be inserted, and if we
-        // come across some data that causes a bug inserting, then nothing would ever be inserted
-        // (until we fixed the bug). Probably shouldnt be an issue, since any weird stuff with
-        // api data should be caught by the json deserializer in apiinterface
-        sqlx::query("BEGIN TRANSACTION;")
-            .execute(&mut self.db)
-            .await?;
-
-        let mut total = 0;
-
-        for activity in activities {
-            let director_activity_hash =
-                activity.details.director_activity_hash;
-
-            //these are DestinyActivityDefinition manifest hashes for gambit private
-            //matches
-            //TODO: can rewrite this to short circuit when first result found
-            //if !(director_activity_hash != 2526740498 && director_activity_hash != 248695599)
-
-            if director_activity_hash == 2526740498
-                || director_activity_hash == 248695599
-            {
-                //gambit private matches. ignoring
-
-                continue;
-            }
-
-            total += 1;
-
-            let instance_id = activity.details.instance_id;
-
-            //TODO: its possible we could insert the activity, and its already been
-            //synced for another character. we could potentially detect this, and when we
-            //insert it we flag it as already synced. Need to check if this would impact
-            //update logic for detecting new activities (seeing which was the latest synced)
-            //
-            //Added the or IGNORE to work around a case where sometimes we would
-            //get into a state where the foriegn key constraint would failed (potentially
-            //do to issue above). This works around the issue.
-            match sqlx::query(
-                "INSERT or IGNORE into activity_queue ('activity_id', 'character') VALUES (?, ?)",
-            )
-            .bind(instance_id)
-            .bind(character_id)
-            .execute(&mut self.db)
-            .await
-            {
-                Ok(_e) => (),
-                Err(e) => {
-                    sqlx::query("ROLLBACK;").execute(&mut self.db).await?;
-                    return Err(Error::from(e));
-                }
-            };
-        }
-        sqlx::query("COMMIT;").execute(&mut self.db).await?;
-
-        let queue_after: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
-        )
-        .bind(character_id)
-        .fetch_one(&mut self.db)
-        .await
-        .unwrap_or(0);
-
-        let actually_inserted = queue_after - queue_before;
-        tell::update!("DEBUG: Queue insert complete. Before={} After={} Actually inserted={} (tried to insert {})",
-            queue_before, queue_after, actually_inserted, total);
-
-        Ok(SyncResult {
-            total_available: total,
-            total_synced: total,
-        })
     }
 
     //todo: this doesnt need to be an instance fn, not sure if it matters
@@ -1508,7 +1060,15 @@ impl ActivityStoreInterface {
                     .await?;
 
                 let inserted = match self._insert_activity(activity, character_id).await {
-                    Ok(_) => true,
+                    Ok(_) => {
+                        sqlx::query("UPDATE activity_queue SET synced=1 WHERE activity_id=?")
+                            .bind(activity.activity_details.instance_id)
+                            .execute(&mut self.db).await?;
+                        sqlx::query("DELETE FROM sync_unavailable WHERE activity_id=?")
+                            .bind(activity.activity_details.instance_id)
+                            .execute(&mut self.db).await?;
+                        true
+                    },
                     Err(e) => {
                         sqlx::query("ROLLBACK TO SAVEPOINT activity_insert;")
                             .execute(&mut self.db)
@@ -1703,7 +1263,6 @@ impl ActivityStoreInterface {
             || activity.activity_details.director_activity_hash
                 == COMPETITIVE_PVP_ACTIVITY_HASH_S25
         {
-
             if activity.activity_details.mode == Mode::ZoneControl {
                 self.set_mode(activity, Mode::CollisionCompetitive);
                 self.add_to_modes(activity, Mode::PvPCompetitive);
@@ -2064,18 +1623,17 @@ impl ActivityStoreInterface {
         let character_activity_stats_id: i32 = row.try_get("id")?;
 
         if !medal_hash.is_empty() {
+            let mut medals: Vec<_> = medal_hash.iter().collect();
+            medals.sort_unstable_by(|a, b| a.0.cmp(b.0));
             let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "main"."medal_result" ("reference_id", "count", "character_activity_stats") "#,
             );
 
-            query_builder.push_values(
-                medal_hash.iter(),
-                |mut b, (key, value)| {
-                    b.push_bind(key.clone())
-                        .push_bind(format!("{}", value.basic.value as u32))
-                        .push_bind(character_activity_stats_id);
-                },
-            );
+            query_builder.push_values(medals, |mut b, (key, value)| {
+                b.push_bind(key.clone())
+                    .push_bind(format!("{}", value.basic.value as u32))
+                    .push_bind(character_activity_stats_id);
+            });
 
             query_builder.build().execute(&mut self.db).await?;
         }
@@ -2114,19 +1672,18 @@ impl ActivityStoreInterface {
         if let Some(extended) = &char_data.extended {
             if let Some(scoreboard) = &extended.scoreboard_values {
                 if !scoreboard.is_empty() {
+                    let mut values: Vec<_> = scoreboard.iter().collect();
+                    values.sort_unstable_by(|a, b| a.0.cmp(b.0));
                     let mut query_builder: QueryBuilder<Sqlite> =
                         QueryBuilder::new(
                             r#"INSERT INTO "main"."scoreboard_result" ("reference_id", "value", "character_activity_stats") "#,
                         );
 
-                    query_builder.push_values(
-                        scoreboard.iter(),
-                        |mut b, (key, value)| {
-                            b.push_bind(key.clone())
-                                .push_bind(value.basic.value)
-                                .push_bind(character_activity_stats_id);
-                        },
-                    );
+                    query_builder.push_values(values, |mut b, (key, value)| {
+                        b.push_bind(key.clone())
+                            .push_bind(value.basic.value)
+                            .push_bind(character_activity_stats_id);
+                    });
 
                     query_builder.build().execute(&mut self.db).await?;
                 }
@@ -2156,6 +1713,7 @@ impl ActivityStoreInterface {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn has_activity(&mut self, activity_id: &i64) -> bool {
         let out = sqlx::query(
             r#"
@@ -2310,75 +1868,18 @@ impl ActivityStoreInterface {
         character_id: &i64,
         mode: &Mode,
     ) -> Result<i64, Error> {
-        let queue_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM activity_queue WHERE character = ?",
-        )
-        .bind(character_id)
-        .fetch_one(&mut self.db)
-        .await
-        .unwrap_or(0);
-
-        let synced_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM activity_queue WHERE character = ? AND synced = 1"
-        )
-        .bind(character_id)
-        .fetch_one(&mut self.db)
-        .await
-        .unwrap_or(0);
-
-        let mode_count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(DISTINCT modes.activity)
-            FROM modes
-            INNER JOIN activity_queue ON modes.activity = activity_queue.activity_id
-            WHERE activity_queue.character = ? AND modes.mode = ?
-            "#
-        )
-        .bind(character_id)
-        .bind(mode.as_id())
-        .fetch_one(&mut self.db)
-        .await
-        .unwrap_or(0);
-
-        tell::update!("DEBUG: get_max_activity_id char={} mode={:?}({}) queue_total={} synced={} with_mode={}",
-            character_id, mode, mode.as_id(), queue_count, synced_count, mode_count);
-
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                activity_queue.activity_id as max_activity_id
-            FROM
-                "activity_queue"
-            INNER JOIN
-                activity ON activity_queue.activity_id = activity.activity_id,
-                character_activity_stats ON character_activity_stats.activity = activity.activity_id,
-                character on character_activity_stats.character = character.character_id,
-                modes ON modes.activity = activity.activity_id and modes.mode = ?
-            WHERE
-                character_activity_stats.character = ? AND
-                activity_queue.character = ?
-            ORDER BY activity.period DESC LIMIT 1
-        "#,
+        let boundary: Option<i64> = sqlx::query_scalar(
+            "SELECT q.activity_id FROM activity_queue q \
+             JOIN activity a ON a.activity_id=q.activity_id \
+             JOIN character_activity_stats s ON s.activity=a.activity_id AND s.character=q.character \
+             JOIN modes m ON m.activity=a.activity_id AND m.mode=? \
+             WHERE q.character=? ORDER BY a.period DESC LIMIT 1",
         )
         .bind(mode.as_id())
         .bind(character_id)
-        .bind(character_id)
-        .fetch_all(&mut self.db)
+        .fetch_optional(&mut self.db)
         .await?;
-
-        if rows.is_empty() {
-            tell::update!(
-                "DEBUG: get_max_activity_id returning 0 (no matching rows)"
-            );
-            return Ok(0);
-        }
-
-        let row = &rows[0];
-        let activity_id: i64 = row.try_get("max_activity_id")?;
-
-        tell::update!("DEBUG: get_max_activity_id returning {}", activity_id);
-
-        Ok(activity_id)
+        Ok(boundary.unwrap_or(0))
     }
 
     pub async fn retrieve_activity(
@@ -3203,10 +2704,20 @@ pub enum SyncProgress {
         class_name: String,
     },
     /// Downloading activity details (PGCRs)
-    DownloadingActivities { current: u32, total: u32 },
-    SavingActivities { current: u32, total: u32 },
-    Complete { total_synced: u32 },
-    Failed { message: String },
+    DownloadingActivities {
+        current: u32,
+        total: u32,
+    },
+    SavingActivities {
+        current: u32,
+        total: u32,
+    },
+    Complete {
+        total_synced: u32,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 impl SyncProgress {

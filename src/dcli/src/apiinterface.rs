@@ -68,8 +68,9 @@ use crate::{
 
 use crate::character::Characters;
 
+#[derive(Clone)]
 pub struct ApiInterface {
-    client: ApiClient,
+    pub(crate) client: ApiClient,
 }
 
 impl ApiInterface {
@@ -847,61 +848,30 @@ impl ApiInterface {
         &self,
         instance_id: i64,
     ) -> Result<Option<DestinyPostGameCarnageReportData>, Error> {
+        self.retrieve_post_game_carnage_report_bounded(instance_id)
+            .await
+            .map(|(report, _permit)| report)
+    }
+
+    pub async fn retrieve_post_game_carnage_report_bounded(
+        &self,
+        instance_id: i64,
+    ) -> Result<
+        (
+            Option<DestinyPostGameCarnageReportData>,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+        Error,
+    > {
         let url = format!(
             "{base}/Platform/Destiny2/Stats/PostGameCarnageReport/{instance_id}/",
             base = PGCR_BASE_URL,
             instance_id = instance_id,
         );
-
-        // Retry transient API and transport failures with exponential backoff.
-        const MAX_RETRIES: u32 = 3;
-        const BASE_DELAY_MS: u64 = 100;
-
-        let mut last_error: Option<Error> = None;
-
-        for attempt in 0..MAX_RETRIES {
-            if attempt > 0 {
-                let delay = BASE_DELAY_MS * (1 << attempt);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay))
-                    .await;
-            }
-
-            match self.client.call_and_parse::<PGCRResponse>(&url).await {
-                Ok(response) => {
-                    let data: DestinyPostGameCarnageReportData = match response
-                        .response
-                    {
-                        Some(e) => e,
-                        None => {
-                            if response.status.error_code
-                                == API_RESPONSE_STATUS_SUCCESS
-                            {
-                                return Ok(None);
-                            } else {
-                                last_error = Some(Error::ApiRequest {
-                                    description: format!(
-                                        "API error code {} for PGCR {}",
-                                        response.status.error_code, instance_id
-                                    ),
-                                });
-                                continue;
-                            }
-                        }
-                    };
-                    return Ok(Some(data));
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| Error::ApiRequest {
-            description: format!(
-                "Failed to retrieve PGCR {} after {} retries",
-                instance_id, MAX_RETRIES
-            ),
-        }))
+        let (response, permit) = self
+            .client
+            .call_and_parse_bounded::<PGCRResponse>(&url)
+            .await?;
+        Ok((response.response, permit))
     }
 }

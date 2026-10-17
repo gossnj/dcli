@@ -26,10 +26,17 @@ use crate::error::Error;
 
 pub const API_RESPONSE_STATUS_SUCCESS: u32 = 1;
 
+pub fn is_destiny_throttle_code(code: u32) -> bool {
+    matches!(code, 31 | 35 | 36 | 37 | 51 | 54 | 55 | 56 | 57)
+}
+
 pub fn check_destiny_response_status(
     status: &DestinyResponseStatus,
 ) -> Result<(), Error> {
     match status.error_code {
+        code if is_destiny_throttle_code(code) => {
+            Err(Error::ApiThrottle { code })
+        }
         1 => Ok(()),
         5 => Err(Error::ApiNotAvailableException),
         7 => Err(Error::ParameterParseFailure),

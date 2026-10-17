@@ -34,8 +34,14 @@ use crate::response::activities::MAX_ACTIVITIES_REQUEST_COUNT;
 #[derive(Eq, PartialEq, Debug)]
 pub enum Error {
     ApiRequest { description: String },
+    ApiTransport,
     ApiStatus { description: String },
     ApiResponseMissing,
+    ApiHttpStatus { status: u16 },
+    ApiThrottle { code: u32 },
+    ApiBodyTooLarge,
+    ApiUnsupportedEncoding,
+    ApiMalformedEncoding,
 
     //when parameters are malformed in wrong format (i.e. expecting id, getting a name)
     ParameterParseFailure,
@@ -73,12 +79,18 @@ pub enum Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> Result {
         match self {
+            Error::ApiTransport => write!(f, "Destiny 2 API transport failed."),
             Error::ApiRequest { description } => {
                 write!(f, "Error calling Destiny 2 API. {}", description)
             },
             Error::InvalidArgument { description } => {
                 write!(f, "Invalid Argument. {}", description)
             },
+            Error::ApiHttpStatus { status } => write!(f, "Destiny 2 API returned HTTP {}.", status),
+            Error::ApiThrottle { code } => write!(f, "Destiny 2 API requested throttling (code {}).", code),
+            Error::ApiBodyTooLarge => write!(f, "Destiny 2 API response exceeded the size limit."),
+            Error::ApiUnsupportedEncoding => write!(f, "Destiny 2 API returned an unsupported encoding."),
+            Error::ApiMalformedEncoding => write!(f, "Destiny 2 API response encoding is malformed or incomplete."),
             Error::ApiStatus { description } => {
                 write!(f, "Destiny 2 API call returned an error. {}", description)
             },
@@ -203,9 +215,7 @@ impl From<reqwest::Error> for Error {
         } else if err.is_request() {
             Error::Request
         } else {
-            Error::ApiRequest {
-                description: format!("reqwest::Error : {:#?}", err),
-            }
+            Error::ApiTransport
         }
     }
 }
@@ -239,5 +249,25 @@ impl From<chrono::format::ParseError> for Error {
         Error::ChronoParse {
             description: format!("chrono::format::ParseError : {:#?}", err),
         }
+    }
+}
+
+impl Error {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Error::ApiTransport
+                | Error::Request
+                | Error::RequestTimedOut
+                | Error::ApiNotAvailableException
+                | Error::ApiThrottle { .. }
+                | Error::ApiHttpStatus {
+                    status: 429 | 500 | 502 | 503 | 504
+                }
+        )
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Error::PrivacyException)
     }
 }
