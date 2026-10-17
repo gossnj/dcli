@@ -25,10 +25,13 @@ Path: @/
 
 ### Things to Know
 
-- Seven CLI applications expose `--version`. `dclisync` accepts multiple values for sync, add, and remove operations; `dclistat` requires one or more `--stat` values.
+- Initial history sync records a durable boundary for each player, character, and mode in [src/dcli/src/activitystoreinterface/sync.rs](src/dcli/src/activitystoreinterface/sync.rs). New history above that frozen activity-ID boundary is left for the next scan, while discovered activity IDs and unavailable reports are recorded separately so interrupted work can resume without changing the existing activity schema.
+- The scanner pages Crucible and private-match history, saves discovered IDs before downloading reports, and publishes readiness only after the corresponding report writes commit. The most recent 50 become ready after every stream has crossed their time cutoff; full completion additionally requires discovery to finish with no pending or unavailable reports.
+- [src/dcli/src/apiclient.rs](src/dcli/src/apiclient.rs) owns a shared request budget: at most 25 in-flight requests, one request start per 1/100 second, and four concurrent response bodies. It accepts identity or gzip responses, caps encoded transfer at 16 MiB and decoded body at 8 MiB, and applies retry/cooldown handling. Gzip support uses the locked dependencies in [src/dcli/Cargo.toml](src/dcli/Cargo.toml) and [src/Cargo.lock](src/Cargo.lock); the workspace remains pinned to Rust 1.83.0.
+- [src/dcli-ffi/src/sync.rs](src/dcli-ffi/src/sync.rs) exposes additive version-1 coverage and cancellation contracts. A successful C return means an outcome was produced; callers inspect the full-history flag to distinguish complete coverage. The callback event is valid only during the callback, cancellation has independent lifetime rules, and callers must not re-enter the store from the callback.
+- The Last Banner consumer has separate Swift-side publication and UI-readiness behavior. Building this repository alone does not update that consumer's source pin or bundled archives.
 - Three checked-in archives under [src/dcli-ffi/build](src/dcli-ffi/build) are historical binaries. They do not export `dcli_store_init_with_diagnostics` or `dcli_store_close`; rebuild the library from current source before using those current header APIs.
-- The FFI header progress declarations describe existing Rust exports; this change did not add native ABI implementations.
-- The Last Banner app maintains its own Rust library build and source pin. Changes in this repository do not update that consumer automatically.
 - CI validation does not itself publish a release. Desktop release packaging runs only for an existing tag and requires `DESTINY_API_KEY`.
+
 
 Created and maintained by Nori.

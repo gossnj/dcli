@@ -37,6 +37,10 @@ impl Drop for TestDirectory {
 }
 
 fn report(id: i64, weapon: u32) -> DestinyPostGameCarnageReportData {
+    serde_json::from_value(report_json(id, weapon)).unwrap()
+}
+
+fn report_json(id: i64, weapon: u32) -> serde_json::Value {
     let mut values = serde_json::Map::new();
     for name in [
         "assists",
@@ -60,7 +64,7 @@ fn report(id: i64, weapon: u32) -> DestinyPostGameCarnageReportData {
     ] {
         values.insert(name.to_owned(), json!({"basic": {"value": 1}}));
     }
-    serde_json::from_value(json!({
+    json!({
         "period": "2026-01-01T12:00:00Z",
         "activityDetails": {"referenceId": 1, "directorActivityHash": 1,
             "instanceId": id.to_string(), "mode": 71, "modes": [5, 71], "isPrivate": false, "membershipType": 3},
@@ -77,7 +81,7 @@ fn report(id: i64, weapon: u32) -> DestinyPostGameCarnageReportData {
                 ],
                 "scoreboardValues": {"damageDealt": {"basic": {"value": 1234}}, "objectivesCompleted": {"basic": {"value": 2}}}}
         }]
-    })).unwrap()
+    })
 }
 
 async fn seed_queue(store: &mut ActivityStoreInterface, ids: &[i64]) {
@@ -442,3 +446,6 @@ async fn assert_bulk_child_rollback(table: &str) {
     assert_eq!(backfill.total_synced, 0);
     store.db.close().await.unwrap();
 }
+
+#[path = "sync_regression.rs"]
+mod sync_regression;

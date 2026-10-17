@@ -23,6 +23,9 @@
 #[cfg(target_os = "android")]
 mod android;
 
+mod sync;
+pub use sync::*;
+
 use log::{debug, error, info};
 
 #[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]

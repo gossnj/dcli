@@ -39,13 +39,13 @@ This directory contains the implementation of the dcli library declared in @/dcl
 
 ### Things to Know
 
-**Sync Architecture** (activitystoreinterface.rs):
-- `SyncProgress` enum provides granular progress phases: `Starting`, `FetchingHistory`, `DownloadingActivities`, `SavingActivities`, `Complete`, `Failed`. Used by FFI layer for mobile app progress UI.
-- `sync_player_with_progress<F>()` accepts a progress callback invoked at each sync phase. Wraps `sync_member_with_progress()` which iterates characters.
-- Activity queue queries use `ORDER BY activity_id DESC` to prioritize recent games - ensures users see newest activities first if sync is interrupted.
-- `insert_activities_batch()` wraps the batch in an outer SQLite transaction and each report insert in a savepoint. An insert failure rolls that report back, logs it, and allows the remaining reports to continue; the failed report remains queued for a later sync. Savepoint-control or batch-commit failures roll back the outer transaction and return an error.
-- PGCR_REQUEST_CHUNK_AMOUNT = 25 (reduced from 100) controls concurrent API requests per batch. Lower values avoid Bungie API rate limiting.
-- `retrieve_post_game_carnage_report()` includes retry logic with exponential backoff (3 retries, 100ms/200ms/400ms delays) to handle transient API failures.
+**Initial History Sync** ([activitystoreinterface/sync.rs](activitystoreinterface/sync.rs), [apiclient.rs](apiclient.rs)):
+- Each member/character/mode stream freezes its activity-ID boundary at the highest ID already stored. History discovery resumes from durable `sync_scan` state, pages API history, and records discovered IDs in `sync_history` before report download. Activities above the frozen boundary are picked up by a later scan.
+- The auxiliary scan tables are installed transactionally during store initialization without changing the version-10 activity schema. Report availability and pending queue state remain separate; privacy-unavailable reports are tracked as unavailable, and only committed report writes count toward readiness.
+- Recent readiness requires the newest 50 discovered activities to be present in the activity store and every unfinished stream to have crossed their period cutoff. Full completion additionally requires discovery to end with zero pending or unavailable reports. The older `SyncProgress` callback remains available to existing CLI callers.
+- `insert_activities_batch()` preserves the existing parent/child report transaction boundary: each report uses a savepoint inside the batch transaction, so one report failure can remain queued while later reports commit.
+- The shared transport budget permits 25 in-flight requests, starts requests at a 100-per-second production cadence, and allows four response bodies to be buffered at once. Responses accept identity or gzip encoding; encoded transfer is capped at 16 MiB and decoded bodies at 8 MiB. Retry and server cooldown handling apply to transient or throttled responses.
+- Gzip support is provided by the locked `reqwest` and `async-compression` dependencies in [Cargo.toml](../Cargo.toml) and [Cargo.lock](../../Cargo.lock), under the workspace's Rust 1.83.0 toolchain.
 
 **Scoreboard Data Persistence** (activitystoreinterface.rs):
 - `scoreboard_result` junction table stores scoreboardValues from Bungie PGCRs (scoreboard scores, reward scores, multipliers) linked to `character_activity_stats` via foreign key.

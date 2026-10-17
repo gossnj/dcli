@@ -202,4 +202,35 @@ void dcli_string_free(char *s);
  */
 char *dcli_get_last_error(void);
 
+
+/** Independent cancellation signal; retain until sync and cancellation callers return. */
+typedef struct DcliSyncControl DcliSyncControl;
+
+/** Version 1 coverage snapshot. Flags: 1 discovery complete, 2 recent ready,
+ * 4 full history complete, 8 cancelled. Phases: 0 starting, 1 discovering,
+ * 2 committed, 3 recent ready, 4 complete, 5 cancelled, 6 incomplete. */
+typedef struct DcliSyncEventV1 {
+  uint32_t version;
+  uint32_t phase;
+  uint32_t discovered;
+  uint32_t committed;
+  uint32_t pending;
+  uint32_t unavailable;
+  uint32_t flags;
+} DcliSyncEventV1;
+
+/** Copy the event before dispatch; its pointer expires on return. Do not reenter the store. */
+typedef void (*DcliSyncCallbackV1)(const DcliSyncEventV1 *event, void *user_data);
+DcliSyncControl *dcli_sync_control_new(void);
+/** Safe to signal concurrently with sync; null is a no-op. */
+void dcli_sync_control_cancel(const DcliSyncControl *control);
+bool dcli_sync_control_is_cancelled(const DcliSyncControl *control);
+/** Free only after sync and all cancellation callers return. */
+void dcli_sync_control_free(DcliSyncControl *control);
+/** True means an outcome is available; inspect flag 4 for full completion.
+ * Keep token, context and output alive through this call on the store owner. */
+bool dcli_store_sync_player_v1(DcliActivityStore *store, const char *bungie_name,
+                               const DcliSyncControl *control, DcliSyncCallbackV1 callback,
+                               void *user_data, DcliSyncEventV1 *out_outcome);
+
 #endif  /* DCLI_FFI_H */
