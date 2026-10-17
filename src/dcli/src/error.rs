@@ -257,6 +257,7 @@ impl Error {
         matches!(
             self,
             Error::ApiTransport
+                | Error::Request
                 | Error::RequestTimedOut
                 | Error::ApiNotAvailableException
                 | Error::ApiThrottle { .. }

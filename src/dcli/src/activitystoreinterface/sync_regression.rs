@@ -53,6 +53,7 @@ impl Server {
                             let request = String::from_utf8(request).unwrap();
                             let path = request.split_whitespace().nth(1).unwrap().to_owned();
                             let reply = handler(path);
+                            if reply.status == 0 { return; }
                             let encoding = reply.encoding.map(|v| format!("Content-Encoding: {}\r\n", v)).unwrap_or_default();
                             let retry_after = reply.retry_after.map(|v| format!("Retry-After: {}\r\n", v)).unwrap_or_default();
                             let header = format!("HTTP/1.1 {} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}{}Connection: close\r\n\r\n", reply.status, reply.body.len(), encoding, retry_after);
@@ -640,4 +641,67 @@ async fn http_retry_after_is_respected() {
     assert!(
         attempts[1].duration_since(attempts[0]) >= Duration::from_millis(950)
     );
+}
+
+#[sqlx::test]
+async fn transient_disconnect_retries_and_commits_in_the_same_pass() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed = calls.clone();
+    let server = Server::new(move |_| {
+        if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply {
+                status: 0,
+                body: Vec::new(),
+                encoding: None,
+                retry_after: None,
+            }
+        } else {
+            Reply::json(envelope(report_json(1, 1)))
+        }
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &[1]).await;
+    server.attach(&mut store);
+    let result = store.sync_activities(&100).await.unwrap();
+    assert_eq!(
+        result.total_synced, 1,
+        "a dropped connection must recover within the current sync pass"
+    );
+    assert!(store.has_activity(&1).await);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[sqlx::test]
+async fn repeated_disconnects_exhaust_a_bounded_retry_budget_and_remain_pending(
+) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed = calls.clone();
+    let server = Server::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Reply {
+            status: 0,
+            body: Vec::new(),
+            encoding: None,
+            retry_after: None,
+        }
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &[1]).await;
+    server.attach(&mut store);
+    let result = store.sync_activities(&100).await.unwrap();
+    assert_eq!(result.total_synced, 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "transport retries must stop after three attempts"
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM activity_queue WHERE synced=0",
+    )
+    .fetch_one(&mut store.db)
+    .await
+    .unwrap();
+    assert_eq!(pending, 1);
 }
