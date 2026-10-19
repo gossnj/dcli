@@ -721,15 +721,15 @@ async fn large_history_discovery_does_not_wait_for_old_reports() {
     const COUNT: i64 = 10_250;
     let discovered = Arc::new(AtomicBool::new(false));
     let history_finished = discovered.clone();
+    let older_requested = Arc::new(AtomicBool::new(false));
+    let observed_older_request = older_requested.clone();
+    let control = SyncControl::default();
+    let server_control = control.clone();
     let server = Server::new(move |path| {
         if let Some(id) = pgcr_id(&path) {
-            if id <= COUNT - 50 {
-                let deadline = Instant::now() + Duration::from_secs(8);
-                while !history_finished.load(Ordering::SeqCst)
-                    && Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+            if id <= COUNT - 50 && !history_finished.load(Ordering::SeqCst) {
+                observed_older_request.store(true, Ordering::SeqCst);
+                server_control.cancel();
             }
             return Reply::json(envelope(report_json(id, id as u32)));
         }
@@ -747,10 +747,12 @@ async fn large_history_discovery_does_not_wait_for_old_reports() {
     let directory = TestDirectory::new();
     let mut store = directory.open().await;
     server.attach(&mut store);
-    let control = SyncControl::default();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let observed_timeout = timed_out.clone();
     let timeout_control = control.clone();
     let timeout = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        observed_timeout.store(true, Ordering::SeqCst);
         timeout_control.cancel();
     });
     let result = store
@@ -762,10 +764,19 @@ async fn large_history_discovery_does_not_wait_for_old_reports() {
         })
         .await;
     timeout.abort();
-    // Release fixture connections even when the regression fails.
-    let completed_discovery = discovered.swap(true, Ordering::SeqCst);
     let outcome = result.unwrap();
-    assert!(completed_discovery, "all 10,250 IDs must be discovered without waiting for older report bodies");
+    assert!(
+        !timed_out.load(Ordering::SeqCst),
+        "large-history fixture exceeded its safety timeout"
+    );
+    assert!(
+        !older_requested.load(Ordering::SeqCst),
+        "older report requests must not begin before all history is discovered"
+    );
+    assert!(
+        discovered.load(Ordering::SeqCst),
+        "all 10,250 IDs must be discovered without waiting for older report bodies"
+    );
     assert!(
         outcome.recent_ready,
         "latest 50 usable reports must remain available"
