@@ -449,3 +449,32 @@ async fn assert_bulk_child_rollback(table: &str) {
 
 #[path = "sync_regression.rs"]
 mod sync_regression;
+
+#[sqlx::test]
+async fn unknown_activity_modes_survive_pgcr_storage_and_reopen() {
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &[1, 2]).await;
+    for (activity_id, mode_id) in [(1, 94_u32), (2, u32::MAX)] {
+        let mut value = report_json(activity_id, 9000);
+        value["activityDetails"]["mode"] = json!(mode_id);
+        value["activityDetails"]["modes"] = json!([5, mode_id]);
+        let pgcr = serde_json::from_value(value).expect("unknown mode must not reject PGCR");
+        assert_eq!(store.insert_activities_batch(&mut [pgcr], &100).await.unwrap(), 1);
+    }
+    store.db.close().await.unwrap();
+    let mut reopened = directory.open().await;
+    let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT activity_id, mode FROM activity ORDER BY activity_id")
+        .fetch_all(&mut reopened.db).await.unwrap();
+    assert_eq!(rows, vec![(1, 94), (2, u32::MAX as i64)]);
+    for (activity_id, mode_id) in rows {
+        assert_eq!(Mode::from_id(mode_id as u32).unwrap().as_id(), mode_id as u32);
+        let modes: Vec<i64> = sqlx::query_scalar("SELECT mode FROM modes WHERE activity=? ORDER BY mode")
+            .bind(activity_id).fetch_all(&mut reopened.db).await.unwrap();
+        assert_eq!(modes, vec![5, mode_id]);
+    }
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activity_queue WHERE synced=0")
+        .fetch_one(&mut reopened.db).await.unwrap();
+    assert_eq!(pending, 0);
+    reopened.db.close().await.unwrap();
+}

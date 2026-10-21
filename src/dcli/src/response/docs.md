@@ -16,13 +16,13 @@ Response structs are the bridge between raw JSON from Bungie API and typed Rust 
 
 **Key Response Modules**:
 
-- **pgcr.rs** (10496 lines): `PGCRResponse` and `DestinyPostGameCarnageReportData`. Post Game Carnage Report containing detailed match data. Includes:
+- **pgcr.rs**: `PGCRResponse` and `DestinyPostGameCarnageReportData`. The activity details use `DestinyHistoricalStatsActivity` from @/dcli/src/dcli/src/response/activities.rs, shared with activity-history results. The report also includes:
   - `DestinyPostGameCarnageReportEntry`: Per-player performance
   - `DestinyHistoricalStatsValue`: Individual stat values
   - `DestinyPostGameCarnageReportActivityDetails`: Match metadata (mode, map, etc.)
   - Team results, player loadouts, weapon stats, medals
 
-- **activities.rs** (5438 lines): `ActivitiesResponse` and `Activity`. List of activities from activity history endpoint. Contains activity IDs, dates, modes for pagination through player history.
+- **activities.rs**: `ActivitiesResponse` and `Activity` model the activity-history endpoint and its pagination data. `Activity.details` uses `DestinyHistoricalStatsActivity`, which holds typed `Mode` values for both the activity's `mode` and API-provided `modes` list.
 
 - **stats.rs** (10687 lines): `AllTimePvPStatsResponse`, `DailyPvPStatsResponse`, `PvpStatsData`, `DailyPvPStatsValuesData`. Aggregated statistics from Bungie's stat endpoints.
 
@@ -72,7 +72,7 @@ All response structs use serde derives with `rename_all = "camelCase"` to match 
 
 **MAX_ACTIVITIES_REQUEST_COUNT**: Constant in activities.rs defining max activities per page (250). Used for pagination loops.
 
-**Platform and Mode IDs**: Response structs use raw numeric IDs (u32, i32). These are converted to enum types (Platform, Mode, etc.) during processing in apiinterface.rs or activitystoreinterface.rs.
+**Activity Modes**: `DestinyHistoricalStatsActivity.mode` and `.modes` deserialize numeric IDs directly as `Mode`. Named IDs become known variants, while unrecognized IDs remain `Mode::Unknown(id)` and serialize back to the same number. The `modes` list preserves the categories supplied by Bungie; consumers should not infer additional categories from an unknown ID.
 
 **Error Responses**: Bungie API wraps data in `{ Response: T, ErrorCode: i32, ErrorStatus: String }` structure. Response types handle this outer wrapper and check error codes.
 

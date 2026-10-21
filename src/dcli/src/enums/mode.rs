@@ -24,12 +24,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::error::Error;
-use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 //https://bungie-net.github.io/multi/schema_Destiny-HistoricalStats-Definitions-DestinyActivityModeType.html#schema_Destiny-HistoricalStats-Definitions-DestinyActivityModeType
-#[derive(
-    Eq, PartialEq, Clone, Copy, Debug, Serialize_repr, Deserialize_repr,
-)]
+#[derive(Eq, PartialEq, Clone, Copy, Debug)]
 #[repr(u32)]
 pub enum Mode {
     None = 0,
@@ -134,6 +132,7 @@ pub enum Mode {
 
     IronBannerTribute = 800,
     IronBannerFortress = 801,
+    Unknown(u32),
 }
 
 impl Mode {
@@ -240,12 +239,112 @@ impl Mode {
             800 => Ok(Mode::IronBannerTribute),
             801 => Ok(Mode::IronBannerFortress),
 
-            _ => Err(Error::UnknownEnumValue),
+            _ => Ok(Mode::Unknown(id)),
         }
     }
 
     pub fn as_id(&self) -> u32 {
-        *self as u32
+        match self {
+            Mode::Unknown(id) => *id,
+            Mode::None => 0,
+            Mode::Story => 2,
+            Mode::Strike => 3,
+            Mode::Raid => 4,
+            Mode::AllPvP => 5,
+            Mode::Patrol => 6,
+            Mode::AllPvE => 7,
+            Mode::Reserved9 => 9,
+            Mode::Control => 10,
+            Mode::Reserved11 => 11,
+            Mode::Clash => 12,
+            Mode::Reserved13 => 13,
+            Mode::CrimsonDoubles => 15,
+            Mode::Nightfall => 16,
+            Mode::HeroicNightfall => 17,
+            Mode::AllStrikes => 18,
+            Mode::IronBanner => 19,
+            Mode::Reserved20 => 20,
+            Mode::Reserved21 => 21,
+            Mode::Reserved22 => 22,
+            Mode::Reserved24 => 24,
+            Mode::AllMayhem => 25,
+            Mode::Reserved26 => 26,
+            Mode::Reserved27 => 27,
+            Mode::Reserved28 => 28,
+            Mode::Reserved29 => 29,
+            Mode::Reserved30 => 30,
+            Mode::Supremacy => 31,
+            Mode::PrivateMatchesAll => 32,
+            Mode::Survival => 37,
+            Mode::Countdown => 38,
+            Mode::TrialsOfTheNine => 39,
+            Mode::Social => 40,
+            Mode::TrialsCountdown => 41,
+            Mode::TrialsSurvival => 42,
+            Mode::IronBannerControl => 43,
+            Mode::IronBannerClash => 44,
+            Mode::IronBannerSupremacy => 45,
+            Mode::ScoredNightfall => 46,
+            Mode::ScoredHeroicNightfall => 47,
+            Mode::Rumble => 48,
+            Mode::AllDoubles => 49,
+            Mode::Doubles => 50,
+            Mode::PrivateMatchesClash => 51,
+            Mode::PrivateMatchesControl => 52,
+            Mode::PrivateMatchesSupremacy => 53,
+            Mode::PrivateMatchesCountdown => 54,
+            Mode::PrivateMatchesSurvival => 55,
+            Mode::PrivateMatchesMayhem => 56,
+            Mode::PrivateMatchesRumble => 57,
+            Mode::HeroicAdventure => 58,
+            Mode::Showdown => 59,
+            Mode::Lockdown => 60,
+            Mode::Scorched => 61,
+            Mode::ScorchedTeam => 62,
+            Mode::Gambit => 63,
+            Mode::AllPvECompetitive => 64,
+            Mode::Breakthrough => 65,
+            Mode::BlackArmoryRun => 66,
+            Mode::Salvage => 67,
+            Mode::IronBannerSalvage => 68,
+            Mode::PvPCompetitive => 69,
+            Mode::PvPQuickplay => 70,
+            Mode::ClashQuickplay => 71,
+            Mode::ClashCompetitive => 72,
+            Mode::ControlQuickplay => 73,
+            Mode::ControlCompetitive => 74,
+            Mode::GambitPrime => 75,
+            Mode::Reckoning => 76,
+            Mode::Menagerie => 77,
+            Mode::VexOffensive => 78,
+            Mode::NightmareHunt => 79,
+            Mode::Elimination => 80,
+            Mode::Momentum => 81,
+            Mode::Dungeon => 82,
+            Mode::Sundial => 83,
+            Mode::TrialsOfOsiris => 84,
+            Mode::Dares => 85,
+            Mode::Offensive => 86,
+            Mode::LostSector => 87,
+            Mode::Rift => 88,
+            Mode::ZoneControl => 89,
+            Mode::IronBannerRift => 90,
+            Mode::IronBannerZoneControl => 91,
+            Mode::Relic => 92,
+            Mode::RiftCompetitive => 700,
+            Mode::ShowdownCompetitive => 701,
+            Mode::SurvivalCompetitive => 702,
+            Mode::CountdownCompetitive => 703,
+            Mode::CollisionCompetitive => 704,
+            Mode::CheckmateAll => 710,
+            Mode::CheckmateControl => 711,
+            Mode::CheckmateSurvival => 712,
+            Mode::CheckmateRumble => 713,
+            Mode::CheckmateClash => 714,
+            Mode::CheckmateCountdown => 715,
+            Mode::IronBannerTribute => 800,
+            Mode::IronBannerFortress => 801,
+        }
     }
 
     pub fn is_gambit(&self) -> bool {
@@ -335,6 +434,25 @@ impl Mode {
             || *self == Mode::PrivateMatchesSurvival
             || *self == Mode::PrivateMatchesMayhem
             || *self == Mode::PrivateMatchesRumble
+    }
+}
+
+impl Serialize for Mode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u32(self.as_id())
+    }
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Mode::from_id(u32::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -557,6 +675,7 @@ impl fmt::Display for Mode {
             Mode::CheckmateCountdown => "Checkmate Countdown",
             Mode::IronBannerTribute => "Iron Banner Tribute",
             Mode::IronBannerFortress => "Iron Banner Fortress",
+            Mode::Unknown(id) => return write!(f, "Unknown mode ({})", id),
         };
 
         write!(f, "{}", out)
