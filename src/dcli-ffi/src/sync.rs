@@ -1,8 +1,9 @@
 use super::DcliActivityStore;
 use dcli::activitystoreinterface::{
-    SyncControl, SyncEvent, SyncOutcome, SyncPhase,
+    SyncControl, SyncEvent, SyncOutcome, SyncPhase, SyncSliceDisposition,
 };
 use dcli::crucible::PlayerName;
+use dcli::enums::platform::Platform;
 use std::cell::Cell;
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
@@ -74,6 +75,120 @@ impl DcliSyncEventV1 {
 /// Copy it before dispatching elsewhere; never reenter the owning store.
 pub type DcliSyncCallbackV1 =
     extern "C" fn(*const DcliSyncEventV1, *mut c_void);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DcliSyncSliceOptionsV1 {
+    pub version: u32,
+    pub budget_milliseconds: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DcliSyncSliceResultV1 {
+    pub version: u32,
+    pub disposition: u32,
+    pub newly_discovered: u32,
+    pub snapshot: DcliSyncEventV1,
+}
+
+impl DcliSyncSliceResultV1 {
+    fn empty() -> Self {
+        Self {
+            version: 1,
+            disposition: 0,
+            newly_discovered: 0,
+            snapshot: DcliSyncEventV1::empty(),
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcli_store_sync_member_slice_v1(
+    store: *mut DcliActivityStore,
+    member_id: i64,
+    membership_type: i32,
+    options: *const DcliSyncSliceOptionsV1,
+    control: *const DcliSyncControl,
+    callback: Option<DcliSyncCallbackV1>,
+    user_data: *mut c_void,
+    out_result: *mut DcliSyncSliceResultV1,
+) -> bool {
+    if !out_result.is_null() {
+        unsafe {
+            *out_result = DcliSyncSliceResultV1::empty();
+        }
+    }
+    if store.is_null()
+        || out_result.is_null()
+        || options.is_null()
+        || member_id <= 0
+        || !(1..=6).contains(&membership_type)
+    {
+        return false;
+    }
+    let options = unsafe { &*options };
+    if options.version != 1 {
+        return false;
+    }
+    let control = unsafe { control.as_ref() }
+        .map(|token| token.control.clone())
+        .unwrap_or_default();
+    let last = Cell::new(DcliSyncEventV1::empty());
+    let store = unsafe { &mut *store };
+    let result =
+        store
+            .runtime
+            .block_on(store.store.sync_member_slice_with_control(
+                member_id,
+                Platform::from_id(membership_type as u32),
+                std::time::Duration::from_millis(
+                    options.budget_milliseconds as u64,
+                ),
+                &control,
+                |event| {
+                    let event = DcliSyncEventV1::event(&event);
+                    last.set(event);
+                    if let Some(callback) = callback {
+                        callback(&event, user_data);
+                    }
+                },
+            ));
+    match result {
+        Ok(result) => {
+            let disposition = match result.disposition {
+                SyncSliceDisposition::Deferred => 0,
+                SyncSliceDisposition::Checkpointed => 1,
+                SyncSliceDisposition::FullComplete => 2,
+                SyncSliceDisposition::Cancelled => 3,
+            };
+            let phase = if result.outcome.cancelled {
+                5
+            } else if result.outcome.complete {
+                4
+            } else {
+                6
+            };
+            unsafe {
+                *out_result = DcliSyncSliceResultV1 {
+                    version: 1,
+                    disposition,
+                    newly_discovered: result.outcome.newly_discovered,
+                    snapshot: DcliSyncEventV1::snapshot(phase, &result.outcome),
+                };
+            }
+            true
+        }
+        Err(error) => {
+            log::error!("Sync slice failed: {}", error);
+            unsafe {
+                (*out_result).disposition = 4;
+                (*out_result).snapshot = last.get();
+            }
+            false
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn dcli_sync_control_new() -> *mut DcliSyncControl {

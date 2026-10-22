@@ -114,7 +114,7 @@ const SCOREBOARD_VALUES_START_DATE: &str = "2025-08-19T00:00:00Z";
 mod tests;
 
 mod sync;
-pub use sync::{SyncControl, SyncEvent, SyncOutcome, SyncPhase};
+pub use sync::{SyncControl, SyncEvent, SyncOutcome, SyncPhase, SyncSliceDisposition, SyncSliceResult};
 
 pub struct ActivityStoreInterface {
     db: SqliteConnection,
@@ -541,6 +541,58 @@ impl ActivityStoreInterface {
             }
         };
         self.sync_member_engine(&member, control, &on_event).await
+    }
+
+    pub async fn sync_member_slice_with_control<F>(
+        &mut self,
+        member_id: i64,
+        platform: Platform,
+        budget: std::time::Duration,
+        control: &SyncControl,
+        on_event: F,
+    ) -> Result<SyncSliceResult, Error>
+    where
+        F: Fn(SyncEvent),
+    {
+        let empty = SyncOutcome::default();
+        if control.is_cancelled() {
+            return Ok(SyncSliceResult {
+                disposition: SyncSliceDisposition::Cancelled,
+                outcome: SyncOutcome {
+                    cancelled: true,
+                    ..empty
+                },
+            });
+        }
+        if budget.is_zero() {
+            return Ok(SyncSliceResult {
+                disposition: SyncSliceDisposition::Deferred,
+                outcome: empty,
+            });
+        }
+        if member_id <= 0 || platform == Platform::Unknown {
+            return Err(Error::InvalidParameters);
+        }
+        let deadline = std::time::Instant::now() + budget;
+        let scoped = control.with_deadline(deadline);
+        let row = match sync::await_or_cancel(&scoped, sqlx::query(
+            "SELECT member_id,platform_id,display_name,bungie_display_name,bungie_display_name_code FROM member WHERE member_id=? AND platform_id=?",
+        ).bind(member_id).bind(platform.as_id() as i64).fetch_optional(&mut self.db)).await {
+            Some(row) => row?,
+            None => return Ok(SyncSliceResult {
+                disposition: if control.is_cancelled() { SyncSliceDisposition::Cancelled } else { SyncSliceDisposition::Deferred },
+                outcome: SyncOutcome { cancelled: control.is_cancelled(), ..empty },
+            }),
+        };
+        let row = row.ok_or(Error::InvalidParameters)?;
+        let member = self.parse_member_row(&row)?;
+        self.sync_member_slice_engine(
+            &member,
+            control,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            &on_event,
+        )
+        .await
     }
 
     /// Sync a player with granular progress reporting.

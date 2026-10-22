@@ -705,3 +705,523 @@ async fn repeated_disconnects_exhaust_a_bounded_retry_budget_and_remain_pending(
     .unwrap();
     assert_eq!(pending, 1);
 }
+
+fn large_history(ids: &[i64]) -> serde_json::Value {
+    let activities: Vec<_> = ids.iter().map(|id| {
+        let report = report_json(*id, *id as u32);
+        let period = DateTime::<Utc>::from_timestamp(1_767_225_600 + id, 0).unwrap();
+        json!({"period": period.format("%Y-%m-%dT%H:%M:%SZ").to_string(), "activityDetails": report["activityDetails"],
+            "values": report["entries"][0]["values"]})
+    }).collect();
+    envelope(json!({"activities": activities}))
+}
+
+#[sqlx::test]
+async fn large_history_discovery_does_not_wait_for_old_reports() {
+    const COUNT: i64 = 10_250;
+    let discovered = Arc::new(AtomicBool::new(false));
+    let history_finished = discovered.clone();
+    let older_requested = Arc::new(AtomicBool::new(false));
+    let observed_older_request = older_requested.clone();
+    let control = SyncControl::default();
+    let server_control = control.clone();
+    let server = Server::new(move |path| {
+        if let Some(id) = pgcr_id(&path) {
+            if id <= COUNT - 50 && !history_finished.load(Ordering::SeqCst) {
+                observed_older_request.store(true, Ordering::SeqCst);
+                server_control.cancel();
+            }
+            return Reply::json(envelope(report_json(id, id as u32)));
+        }
+        if path.contains("components=") {
+            return Reply::json(profile());
+        }
+        if query(&path, "mode") == Some(32) {
+            return Reply::json(large_history(&[]));
+        }
+        let page = query(&path, "page").unwrap() as usize;
+        let ids: Vec<_> =
+            (1..=COUNT).rev().skip(page * 250).take(250).collect();
+        Reply::json(large_history(&ids))
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    server.attach(&mut store);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let observed_timeout = timed_out.clone();
+    let timeout_control = control.clone();
+    let timeout = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        observed_timeout.store(true, Ordering::SeqCst);
+        timeout_control.cancel();
+    });
+    let result = store
+        .sync_member_engine(&member(), &control, &|event| {
+            if event.outcome.discovery_complete {
+                discovered.store(true, Ordering::SeqCst);
+                control.cancel();
+            }
+        })
+        .await;
+    timeout.abort();
+    let outcome = result.unwrap();
+    assert!(
+        !timed_out.load(Ordering::SeqCst),
+        "large-history fixture exceeded its safety timeout"
+    );
+    assert!(
+        !older_requested.load(Ordering::SeqCst),
+        "older report requests must not begin before all history is discovered"
+    );
+    assert!(
+        discovered.load(Ordering::SeqCst),
+        "all 10,250 IDs must be discovered without waiting for older report bodies"
+    );
+    assert!(
+        outcome.recent_ready,
+        "latest 50 usable reports must remain available"
+    );
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT activity_id FROM sync_history ORDER BY activity_id",
+    )
+    .fetch_all(&mut store.db)
+    .await
+    .unwrap();
+    assert_eq!(ids, (1..=COUNT).collect::<Vec<_>>());
+    let saved: Vec<i64> = sqlx::query_scalar(
+        "SELECT activity_id FROM activity ORDER BY activity_id",
+    )
+    .fetch_all(&mut store.db)
+    .await
+    .unwrap();
+    assert_eq!(saved, ((COUNT - 49)..=COUNT).collect::<Vec<_>>());
+    assert!(!outcome.complete);
+}
+
+#[sqlx::test]
+async fn short_refresh_opportunity_saves_pending_reports_before_slow_discovery()
+{
+    let server = Server::new(|path| {
+        if let Some(id) = pgcr_id(&path) {
+            return Reply::json(envelope(report_json(id, id as u32)));
+        }
+        if path.contains("components=") {
+            return Reply::json(profile());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        Reply::json(history(&[]))
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &(1..=32).collect::<Vec<_>>()).await;
+    sqlx::query("DELETE FROM sync")
+        .execute(&mut store.db)
+        .await
+        .unwrap();
+    server.attach(&mut store);
+    let control = SyncControl::default();
+    let result = store
+        .sync_member_slice_with_control(
+            member().id,
+            member().platform,
+            Duration::from_millis(500),
+            &control,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.disposition, SyncSliceDisposition::Checkpointed);
+    let outcome = result.outcome;
+    assert!(
+        !outcome.cancelled,
+        "a planned checkpoint is distinct from OS cancellation"
+    );
+    assert!(outcome.committed > 0, "a short refresh must advance durable pending work before slow enumeration");
+    let saved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activity")
+        .fetch_one(&mut store.db)
+        .await
+        .unwrap();
+    assert_eq!(saved, outcome.committed as i64);
+    let completed_syncs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync")
+        .fetch_one(&mut store.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        completed_syncs, 0,
+        "a partial refresh must not set the full-sync timestamp"
+    );
+    assert!(!outcome.complete);
+}
+
+#[sqlx::test]
+async fn equal_timestamp_frontier_does_not_publish_premature_recent_readiness()
+{
+    let second_page = Arc::new(AtomicBool::new(false));
+    let observed = second_page.clone();
+    let server = Server::new(move |path| {
+        if let Some(id) = pgcr_id(&path) {
+            return Reply::json(envelope(report_json(id, id as u32)));
+        }
+        if path.contains("components=") {
+            return Reply::json(profile());
+        }
+        if query(&path, "mode") == Some(32) {
+            return Reply::json(history(&[]));
+        }
+        let ids: Vec<i64> = match query(&path, "page") {
+            Some(0) => (1..=50).rev().collect(),
+            Some(1) => {
+                observed.store(true, Ordering::SeqCst);
+                (51..=100).rev().collect()
+            }
+            _ => vec![],
+        };
+        let mut value = history(&ids);
+        for item in value["Response"]["activities"].as_array_mut().unwrap() {
+            item["period"] = json!("2026-01-01T12:00:00Z");
+        }
+        Reply::json(value)
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    server.attach(&mut store);
+    let premature = std::cell::Cell::new(false);
+    let outcome = store
+        .sync_member_engine(&member(), &SyncControl::default(), &|event| {
+            if event.phase == SyncPhase::RecentReady
+                && !second_page.load(Ordering::SeqCst)
+            {
+                premature.set(true);
+            }
+        })
+        .await
+        .unwrap();
+    assert!(!premature.get(), "equal timestamps do not establish that every newest eligible ID is known");
+    assert!(outcome.recent_ready && outcome.complete);
+}
+
+#[sqlx::test]
+async fn zero_budget_and_precancelled_slices_admit_no_requests() {
+    let requests = Arc::new(AtomicU64::new(0));
+    let seen = requests.clone();
+    let server = Server::new(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Reply::json(profile())
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &[1]).await;
+    server.attach(&mut store);
+    let control = SyncControl::default();
+    let zero = store
+        .sync_member_slice_with_control(
+            10,
+            member().platform,
+            Duration::ZERO,
+            &control,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(zero.disposition, SyncSliceDisposition::Deferred);
+    control.cancel();
+    let cancelled = store
+        .sync_member_slice_with_control(
+            10,
+            member().platform,
+            Duration::from_secs(2),
+            &control,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.disposition, SyncSliceDisposition::Cancelled);
+    assert!(cancelled.outcome.cancelled);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+#[sqlx::test]
+async fn slice_new_discovery_is_useful_but_replayed_ids_are_not() {
+    for replay in [false, true] {
+        let server = Server::new(|path| {
+            if let Some(id) = pgcr_id(&path) {
+                std::thread::sleep(Duration::from_millis(700));
+                return Reply::json(envelope(report_json(id, id as u32)));
+            }
+            if path.contains("components=") {
+                return Reply::json(profile());
+            }
+            if query(&path, "mode") == Some(32) {
+                return Reply::json(history(&[]));
+            }
+            Reply::json(history(if query(&path, "page") == Some(0) {
+                &[300, 200, 100]
+            } else {
+                &[]
+            }))
+        });
+        let directory = TestDirectory::new();
+        let mut store = directory.open().await;
+        seed_queue(&mut store, &[]).await;
+        sqlx::query("DELETE FROM sync")
+            .execute(&mut store.db)
+            .await
+            .unwrap();
+        if replay {
+            for id in [300_i64, 200, 100] {
+                sqlx::query("INSERT INTO sync_history(member,activity_id,character,period) VALUES (10,?,100,'2026-01-01T12:00:00Z')")
+                    .bind(id).execute(&mut store.db).await.unwrap();
+            }
+        }
+        server.attach(&mut store);
+        let result = store
+            .sync_member_slice_with_control(
+                10,
+                member().platform,
+                Duration::from_millis(250),
+                &SyncControl::default(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.outcome.committed, 0);
+        assert_eq!(result.outcome.newly_discovered, if replay { 0 } else { 3 });
+        assert_eq!(
+            result.disposition,
+            if replay {
+                SyncSliceDisposition::Deferred
+            } else {
+                SyncSliceDisposition::Checkpointed
+            }
+        );
+        assert!(!result.outcome.complete && !result.outcome.cancelled);
+    }
+}
+
+async fn canonical_report_rows(
+    store: &mut ActivityStoreInterface,
+) -> Vec<(String, Vec<Vec<String>>)> {
+    let mut rows = snapshot(&mut store.db).await;
+    rows.retain(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "activity"
+                | "character"
+                | "member"
+                | "modes"
+                | "team_result"
+                | "weapon_result"
+                | "medal_result"
+                | "character_activity_stats"
+                | "scoreboard_result"
+        )
+    });
+    for (_, table) in &mut rows {
+        table.sort();
+    }
+    rows
+}
+
+#[sqlx::test]
+async fn repeated_refresh_reopens_advance_queue_and_match_uninterrupted_rows() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let slow_listing = Arc::new(AtomicBool::new(true));
+    let slow = slow_listing.clone();
+    let server = Server::new(move |path| {
+        if let Some(id) = pgcr_id(&path) {
+            recorded.lock().unwrap().push(id);
+            return Reply::json(envelope(report_json(id, id as u32)));
+        }
+        if path.contains("components=") {
+            return Reply::json(profile());
+        }
+        if slow.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let ids: Vec<i64> = if query(&path, "mode") != Some(32)
+            && query(&path, "page") == Some(0)
+        {
+            (1..=80).rev().collect()
+        } else {
+            vec![]
+        };
+        Reply::json(history(&ids))
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &(1..=80).collect::<Vec<_>>()).await;
+    sqlx::query("DELETE FROM sync")
+        .execute(&mut store.db)
+        .await
+        .unwrap();
+    store.db.close().await.unwrap();
+    let mut saved = Vec::new();
+    for _ in 0..20 {
+        let mut store = directory.open().await;
+        server.attach(&mut store);
+        requests.lock().unwrap().clear();
+        let result = store
+            .sync_member_slice_with_control(
+                10,
+                member().platform,
+                Duration::from_millis(150),
+                &SyncControl::default(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.disposition, SyncSliceDisposition::Checkpointed);
+        assert!(!result.outcome.cancelled && !result.outcome.complete);
+        let fetched = requests.lock().unwrap().clone();
+        assert!(
+            !fetched.iter().any(|id| saved.contains(id)),
+            "a reopened slice re-fetched an already committed report"
+        );
+        let next: Vec<i64> = sqlx::query_scalar(
+            "SELECT activity_id FROM activity ORDER BY activity_id",
+        )
+        .fetch_all(&mut store.db)
+        .await
+        .unwrap();
+        assert!(
+            next.len() > saved.len(),
+            "each bounded opportunity must advance this pending queue"
+        );
+        saved = next;
+        store.db.close().await.unwrap();
+        if saved.len() == 80 {
+            break;
+        }
+    }
+    assert_eq!(saved, (1..=80).collect::<Vec<_>>());
+    slow_listing.store(false, Ordering::SeqCst);
+    let mut store = directory.open().await;
+    server.attach(&mut store);
+    let final_slice = store
+        .sync_member_slice_with_control(
+            10,
+            member().platform,
+            Duration::from_secs(3),
+            &SyncControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(final_slice.disposition, SyncSliceDisposition::FullComplete);
+    assert!(
+        final_slice.outcome.discovery_complete && final_slice.outcome.complete
+    );
+    assert_eq!(final_slice.outcome.pending, 0);
+    let oracle_directory = TestDirectory::new();
+    let mut oracle = oracle_directory.open().await;
+    server.attach(&mut oracle);
+    let full = oracle
+        .sync_member_engine(&member(), &SyncControl::default(), &|_| {})
+        .await
+        .unwrap();
+    assert!(full.complete);
+    assert_eq!(
+        canonical_report_rows(&mut store).await,
+        canonical_report_rows(&mut oracle).await
+    );
+    let unchanged = store
+        .sync_member_slice_with_control(
+            10,
+            member().platform,
+            Duration::from_secs(3),
+            &SyncControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged.disposition, SyncSliceDisposition::FullComplete);
+    assert_eq!(unchanged.outcome.committed, 0);
+    assert_eq!(unchanged.outcome.newly_discovered, 0);
+}
+
+#[sqlx::test]
+async fn draining_legacy_queue_does_not_hide_undiscovered_older_history() {
+    let server = Server::new(|path| {
+        if let Some(id) = pgcr_id(&path) {
+            return Reply::json(envelope(report_json(id, id as u32)));
+        }
+        if path.contains("components=") {
+            return Reply::json(profile());
+        }
+        if query(&path, "mode") == Some(32) {
+            return Reply::json(history(&[]));
+        }
+        Reply::json(history(match query(&path, "page") {
+            Some(0) => &[300],
+            Some(1) => &[200],
+            Some(2) => &[100],
+            _ => &[],
+        }))
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &[300]).await;
+    sqlx::query("DELETE FROM sync")
+        .execute(&mut store.db)
+        .await
+        .unwrap();
+    server.attach(&mut store);
+    let result = store
+        .sync_member_slice_with_control(
+            10,
+            member().platform,
+            Duration::from_secs(3),
+            &SyncControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.disposition, SyncSliceDisposition::FullComplete);
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT activity_id FROM activity ORDER BY activity_id",
+    )
+    .fetch_all(&mut store.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        ids,
+        vec![100, 200, 300],
+        "new queued commits must not move the frozen history boundary"
+    );
+}
+
+#[sqlx::test]
+async fn external_expiration_after_slice_commit_is_not_a_clean_checkpoint() {
+    let server = Server::new(|path| {
+        if let Some(id) = pgcr_id(&path) {
+            return Reply::json(envelope(report_json(id, id as u32)));
+        }
+        if path.contains("components=") {
+            return Reply::json(profile());
+        }
+        Reply::json(history(&[]))
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    seed_queue(&mut store, &(1..=40).collect::<Vec<_>>()).await;
+    server.attach(&mut store);
+    let control = SyncControl::default();
+    let result = store
+        .sync_member_slice_with_control(
+            10,
+            member().platform,
+            Duration::from_secs(3),
+            &control,
+            |event| {
+                if event.outcome.committed > 0 {
+                    control.cancel();
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.disposition, SyncSliceDisposition::Cancelled);
+    assert!(result.outcome.cancelled && !result.outcome.complete);
+    assert!(result.outcome.committed > 0 && result.outcome.pending > 0);
+}

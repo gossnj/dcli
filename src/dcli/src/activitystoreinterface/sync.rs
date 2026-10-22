@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 pub(super) const SYNC_SCAN_SCHEMA: &str = r#"
@@ -37,8 +38,20 @@ const QUEUE_PAGE_SIZE: i64 = 256;
 const RECENT_COUNT: usize = 50;
 
 /// A cancellation request that can be sent without borrowing the store.
-#[derive(Clone, Default)]
-pub struct SyncControl(Arc<AtomicBool>);
+#[derive(Clone)]
+pub struct SyncControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl Default for SyncControl {
+    fn default() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: None,
+        }
+    }
+}
 
 impl SyncControl {
     pub fn new() -> Self {
@@ -46,16 +59,30 @@ impl SyncControl {
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(super) fn with_deadline(&self, deadline: Instant) -> Self {
+        Self {
+            cancelled: self.cancelled.clone(),
+            deadline: Some(deadline),
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.is_cancelled()
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub async fn cancelled(&self) {
-        while !self.is_cancelled() {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        while !self.should_stop() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 }
@@ -64,7 +91,7 @@ pub(super) async fn await_or_cancel<F: Future>(
     control: &SyncControl,
     request: F,
 ) -> Option<F::Output> {
-    if control.is_cancelled() {
+    if control.should_stop() {
         return None;
     }
     let cancelled = control.cancelled();
@@ -73,7 +100,7 @@ pub(super) async fn await_or_cancel<F: Future>(
     match futures::future::select(cancelled, request).await {
         futures::future::Either::Left(_) => None,
         futures::future::Either::Right((_value, _))
-            if control.is_cancelled() =>
+            if control.should_stop() =>
         {
             None
         }
@@ -92,6 +119,21 @@ pub struct SyncOutcome {
     pub recent_ready: bool,
     pub complete: bool,
     pub cancelled: bool,
+    pub newly_discovered: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncSliceDisposition {
+    Deferred,
+    Checkpointed,
+    FullComplete,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyncSliceResult {
+    pub disposition: SyncSliceDisposition,
+    pub outcome: SyncOutcome,
 }
 
 /// Events expose durable write progress and coverage.
@@ -188,7 +230,7 @@ impl ActivityStoreInterface {
     where
         F: Fn(SyncEvent),
     {
-        if outcome.recent_ready || outcome.cancelled || control.is_cancelled() {
+        if outcome.recent_ready || outcome.cancelled || control.should_stop() {
             return Ok(());
         }
         let enough = recent.len() >= RECENT_COUNT;
@@ -200,7 +242,7 @@ impl ActivityStoreInterface {
                 recent.values().map(|(period, _)| *period).min().unwrap();
             if streams.iter().any(|stream| {
                 !stream.complete
-                    && stream.frontier.map_or(true, |period| period > cutoff)
+                    && stream.frontier.map_or(true, |period| period >= cutoff)
             }) {
                 return Ok(());
             }
@@ -228,6 +270,35 @@ impl ActivityStoreInterface {
         Ok(())
     }
 
+    async fn download_recent<F>(
+        &mut self,
+        recent: &HashMap<i64, (DateTime<Utc>, i64)>,
+        control: &SyncControl,
+        outcome: &mut SyncOutcome,
+        on_event: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(SyncEvent),
+    {
+        let mut selected: Vec<_> = recent
+            .iter()
+            .map(|(id, (period, character))| (*id, *period, *character))
+            .collect();
+        selected
+            .sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        self.download_ids(
+            selected
+                .into_iter()
+                .take(RECENT_COUNT)
+                .map(|(id, _, character)| (id, character))
+                .collect(),
+            control,
+            outcome,
+            on_event,
+        )
+        .await
+    }
+
     pub(super) async fn sync_member_engine<F>(
         &mut self,
         member: &Member,
@@ -237,11 +308,120 @@ impl ActivityStoreInterface {
     where
         F: Fn(SyncEvent),
     {
+        self.sync_member_engine_after_pending(
+            member,
+            control,
+            on_event,
+            SyncOutcome::default(),
+            true,
+        )
+        .await
+    }
+
+    pub(super) async fn sync_member_slice_engine<F>(
+        &mut self,
+        member: &Member,
+        control: &SyncControl,
+        budget: Duration,
+        on_event: &F,
+    ) -> Result<SyncSliceResult, Error>
+    where
+        F: Fn(SyncEvent),
+    {
+        let mut outcome = SyncOutcome::default();
         if control.is_cancelled() {
-            let outcome = SyncOutcome {
-                cancelled: true,
-                ..SyncOutcome::default()
-            };
+            outcome.cancelled = true;
+            return Ok(SyncSliceResult {
+                disposition: SyncSliceDisposition::Cancelled,
+                outcome,
+            });
+        }
+        if budget.is_zero() {
+            return Ok(SyncSliceResult {
+                disposition: SyncSliceDisposition::Deferred,
+                outcome,
+            });
+        }
+        let scoped = control.with_deadline(Instant::now() + budget);
+        self.reset_attempted().await?;
+        self.freeze_known_boundaries(member.id).await?;
+        outcome.discovered = self.discovered_count(member.id).await?;
+        self.update_outcome_coverage(member.id, &mut outcome)
+            .await?;
+        self.download_member_pending(
+            member.id,
+            &scoped,
+            &mut outcome,
+            on_event,
+        )
+        .await?;
+        if !scoped.should_stop() {
+            outcome = self
+                .sync_member_engine_after_pending(
+                    member, &scoped, on_event, outcome, false,
+                )
+                .await?;
+        } else {
+            self.update_outcome_coverage(member.id, &mut outcome)
+                .await?;
+            outcome.cancelled = control.is_cancelled();
+        }
+        let disposition = if outcome.cancelled {
+            SyncSliceDisposition::Cancelled
+        } else if outcome.complete {
+            SyncSliceDisposition::FullComplete
+        } else if outcome.committed > 0 || outcome.newly_discovered > 0 {
+            SyncSliceDisposition::Checkpointed
+        } else {
+            SyncSliceDisposition::Deferred
+        };
+        Ok(SyncSliceResult {
+            disposition,
+            outcome,
+        })
+    }
+
+    async fn freeze_known_boundaries(
+        &mut self,
+        member: i64,
+    ) -> Result<(), Error> {
+        let characters: Vec<i64> = sqlx::query_scalar(
+            "SELECT character_id FROM character WHERE member=?",
+        )
+        .bind(member)
+        .fetch_all(&mut self.db)
+        .await?;
+        for character in characters {
+            for mode in [Mode::AllPvP, Mode::PrivateMatchesAll] {
+                let previous: Option<(i64, i64)> = sqlx::query_as(
+                    "SELECT boundary,complete FROM sync_scan WHERE member=? AND character=? AND mode=?",
+                ).bind(member).bind(character).bind(mode.as_id() as i64)
+                    .fetch_optional(&mut self.db).await?;
+                let boundary = match previous {
+                    Some((boundary, 0)) => boundary,
+                    _ => self.get_max_activity_id(&character, &mode).await?,
+                };
+                sqlx::query("INSERT INTO sync_scan(member,character,mode,boundary,complete) VALUES (?,?,?,?,0) ON CONFLICT(member,character,mode) DO UPDATE SET boundary=excluded.boundary,complete=0")
+                    .bind(member).bind(character).bind(mode.as_id() as i64).bind(boundary)
+                    .execute(&mut self.db).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_member_engine_after_pending<F>(
+        &mut self,
+        member: &Member,
+        control: &SyncControl,
+        on_event: &F,
+        mut outcome: SyncOutcome,
+        reset_attempted: bool,
+    ) -> Result<SyncOutcome, Error>
+    where
+        F: Fn(SyncEvent),
+    {
+        if control.is_cancelled() {
+            outcome.cancelled = true;
             on_event(SyncEvent {
                 phase: SyncPhase::Cancelled,
                 outcome,
@@ -257,29 +437,38 @@ impl ActivityStoreInterface {
         {
             Some(result) => result?,
             None => {
-                let outcome = SyncOutcome {
-                    cancelled: true,
-                    ..SyncOutcome::default()
-                };
+                outcome.cancelled = control.is_cancelled();
                 on_event(SyncEvent {
-                    phase: SyncPhase::Cancelled,
+                    phase: if outcome.cancelled {
+                        SyncPhase::Cancelled
+                    } else {
+                        SyncPhase::Incomplete
+                    },
                     outcome,
                 });
                 return Ok(outcome);
             }
         };
-        if control.is_cancelled() {
-            let outcome = SyncOutcome {
-                cancelled: true,
-                ..SyncOutcome::default()
-            };
+        if control.should_stop() {
+            outcome.cancelled = control.is_cancelled();
             on_event(SyncEvent {
-                phase: SyncPhase::Cancelled,
+                phase: if outcome.cancelled {
+                    SyncPhase::Cancelled
+                } else {
+                    SyncPhase::Incomplete
+                },
                 outcome,
             });
             return Ok(outcome);
         }
-        self.insert_member(&profile.user_info.to_member()).await?;
+        let profile_member = profile.user_info.to_member();
+        if !reset_attempted
+            && (profile_member.id != member.id
+                || profile_member.platform != member.platform)
+        {
+            return Err(Error::InvalidParameters);
+        }
+        self.insert_member(&profile_member).await?;
         let mut streams = Vec::new();
         for character in &profile.characters.characters {
             self.insert_character(&character.id, &character.class_type, member)
@@ -318,22 +507,20 @@ impl ActivityStoreInterface {
             return Err(error);
         }
 
-        let mut outcome = SyncOutcome::default();
         let mut recent: HashMap<i64, (DateTime<Utc>, i64)> = HashMap::new();
-        self.reset_attempted().await?;
+        if reset_attempted {
+            self.reset_attempted().await?;
+        }
         self.load_existing_recent(member.id, &mut recent).await?;
-        let mut first_pages = Vec::new();
-
-        // Admit one page from every stream before fetching details. This makes the
-        // newest period across characters available ahead of old queued work.
+        // Establish a provisional recent set across every stream before fetching
+        // details. Further pages can still displace it at the global frontier.
         for stream in &mut streams {
-            if control.is_cancelled() {
+            if control.should_stop() {
                 break;
             }
-            first_pages.extend(
-                self.scan_page(member, stream, control, &mut recent).await?,
-            );
-            if control.is_cancelled() {
+            self.scan_page(member, stream, control, &mut recent, &mut outcome)
+                .await?;
+            if control.should_stop() {
                 break;
             }
             outcome.discovered = self.discovered_count(member.id).await?;
@@ -347,20 +534,8 @@ impl ActivityStoreInterface {
         outcome.discovery_complete =
             streams.iter().all(|stream| stream.complete);
 
-        if !control.is_cancelled() {
-            let mut selected: Vec<_> = recent
-                .iter()
-                .map(|(id, (period, character))| (*id, *period, *character))
-                .collect();
-            selected.sort_unstable_by(|a, b| {
-                b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0))
-            });
-            let recent_ids: Vec<_> = selected
-                .into_iter()
-                .take(RECENT_COUNT)
-                .map(|(id, _, character)| (id, character))
-                .collect();
-            self.download_ids(recent_ids, control, &mut outcome, on_event)
+        while !control.should_stop() && !outcome.recent_ready {
+            self.download_recent(&recent, control, &mut outcome, on_event)
                 .await?;
             self.maybe_recent_ready(
                 &streams,
@@ -370,42 +545,45 @@ impl ActivityStoreInterface {
                 on_event,
             )
             .await?;
-            for page in first_pages.chunks(QUEUE_PAGE_SIZE as usize) {
-                if control.is_cancelled() {
-                    break;
-                }
-                self.download_ids(
-                    page.to_vec(),
-                    control,
-                    &mut outcome,
-                    on_event,
-                )
-                .await?;
+            if outcome.recent_ready
+                || control.should_stop()
+                || streams.iter().all(|s| s.complete)
+            {
+                break;
             }
-            outcome.discovery_complete =
-                streams.iter().all(|stream| stream.complete);
-            self.maybe_recent_ready(
-                &streams,
-                &recent,
-                control,
-                &mut outcome,
-                on_event,
-            )
-            .await?;
-        }
-
-        while !control.is_cancelled() && streams.iter().any(|s| !s.complete) {
+            let cutoff = if recent.len() >= RECENT_COUNT {
+                recent.values().map(|(period, _)| *period).min()
+            } else {
+                None
+            };
+            if !streams.iter().any(|stream| {
+                !stream.complete
+                    && cutoff.map_or(true, |cutoff| {
+                        stream.frontier.map_or(true, |period| period >= cutoff)
+                    })
+            }) {
+                break;
+            }
             for stream in &mut streams {
-                if control.is_cancelled() {
+                if control.should_stop() {
                     break;
                 }
-                if stream.complete {
+                if stream.complete
+                    || cutoff.is_some_and(|cutoff| {
+                        stream.frontier.is_some_and(|period| period < cutoff)
+                    })
+                {
                     continue;
                 }
-                let page_ids = self
-                    .scan_page(member, stream, control, &mut recent)
-                    .await?;
-                if control.is_cancelled() {
+                self.scan_page(
+                    member,
+                    stream,
+                    control,
+                    &mut recent,
+                    &mut outcome,
+                )
+                .await?;
+                if control.should_stop() {
                     break;
                 }
                 outcome.discovered = self.discovered_count(member.id).await?;
@@ -415,23 +593,48 @@ impl ActivityStoreInterface {
                     phase: SyncPhase::Discovering,
                     outcome,
                 });
-                self.download_ids(page_ids, control, &mut outcome, on_event)
-                    .await?;
             }
-            outcome.discovery_complete =
-                streams.iter().all(|stream| stream.complete);
-            self.maybe_recent_ready(
-                &streams,
-                &recent,
-                control,
-                &mut outcome,
-                on_event,
-            )
-            .await?;
+        }
+
+        while !control.should_stop() && streams.iter().any(|s| !s.complete) {
+            for stream in &mut streams {
+                if control.should_stop() {
+                    break;
+                }
+                if stream.complete {
+                    continue;
+                }
+                self.scan_page(
+                    member,
+                    stream,
+                    control,
+                    &mut recent,
+                    &mut outcome,
+                )
+                .await?;
+                if control.should_stop() {
+                    break;
+                }
+                outcome.discovered = self.discovered_count(member.id).await?;
+                self.update_outcome_coverage(member.id, &mut outcome)
+                    .await?;
+                on_event(SyncEvent {
+                    phase: SyncPhase::Discovering,
+                    outcome,
+                });
+            }
         }
 
         outcome.discovery_complete = streams.iter().all(|s| s.complete);
-        if !control.is_cancelled() {
+        self.update_outcome_coverage(member.id, &mut outcome)
+            .await?;
+        if outcome.discovery_complete && !control.should_stop() {
+            on_event(SyncEvent {
+                phase: SyncPhase::Discovering,
+                outcome,
+            });
+        }
+        if !control.should_stop() {
             self.download_member_pending(
                 member.id,
                 control,
@@ -477,6 +680,7 @@ impl ActivityStoreInterface {
         stream: &mut Stream,
         control: &SyncControl,
         recent: &mut HashMap<i64, (DateTime<Utc>, i64)>,
+        outcome: &mut SyncOutcome,
     ) -> Result<Vec<(i64, i64)>, Error> {
         let page = match await_or_cancel(
             control,
@@ -494,7 +698,7 @@ impl ActivityStoreInterface {
             Some(result) => result?,
             None => return Ok(Vec::new()),
         };
-        if control.is_cancelled() {
+        if control.should_stop() {
             return Ok(Vec::new());
         }
         let Some(activities) = page else {
@@ -507,6 +711,7 @@ impl ActivityStoreInterface {
         }
         let mut reached_boundary = false;
         let mut admitted_ids = Vec::new();
+        let mut new_ids = 0;
         self.begin_transaction().await?;
         let admitted = async {
             for activity in &activities {
@@ -520,9 +725,10 @@ impl ActivityStoreInterface {
                 }
                 sqlx::query("INSERT OR IGNORE INTO activity_queue(activity_id,character) VALUES (?,?)")
                     .bind(id).bind(stream.character).execute(&mut self.db).await?;
-                sqlx::query("INSERT OR IGNORE INTO sync_history(member,activity_id,character,period) VALUES (?,?,?,?)")
+                let inserted = sqlx::query("INSERT OR IGNORE INTO sync_history(member,activity_id,character,period) VALUES (?,?,?,?)")
                     .bind(member.id).bind(id).bind(stream.character).bind(activity.period.to_rfc3339())
                     .execute(&mut self.db).await?;
+                new_ids += inserted.rows_affected() as u32;
                 admitted_ids.push((id, stream.character));
                 recent.entry(id).and_modify(|entry| {
                     if activity.period > entry.0 { *entry = (activity.period, stream.character); }
@@ -534,6 +740,7 @@ impl ActivityStoreInterface {
             self.rollback_transaction().await?;
             return Err(error);
         }
+        outcome.newly_discovered += new_ids;
         trim_recent(recent);
         stream.frontier = activities.last().map(|a| a.period);
         stream.page += 1;
@@ -575,7 +782,7 @@ impl ActivityStoreInterface {
         self.reconcile_queue().await?;
         let mut outcome = SyncOutcome::default();
         let mut cursor = i64::MAX;
-        while !control.is_cancelled() {
+        while !control.should_stop() {
             let ids: Vec<i64> = sqlx::query_scalar(
                 "SELECT activity_id FROM activity_queue WHERE character=? AND synced=0 AND activity_id<? ORDER BY activity_id DESC LIMIT ?")
                 .bind(character).bind(cursor).bind(QUEUE_PAGE_SIZE)
@@ -611,7 +818,7 @@ impl ActivityStoreInterface {
     {
         self.reconcile_queue().await?;
         let mut cursor = i64::MAX;
-        while !control.is_cancelled() {
+        while !control.should_stop() {
             let rows: Vec<(i64, i64)> = sqlx::query_as(
                 "SELECT q.activity_id, MIN(q.character) FROM activity_queue q JOIN character c ON c.character_id=q.character WHERE c.member=? AND q.synced=0 AND q.activity_id<? GROUP BY q.activity_id ORDER BY q.activity_id DESC LIMIT ?")
                 .bind(member).bind(cursor).bind(QUEUE_PAGE_SIZE)
@@ -667,7 +874,7 @@ impl ActivityStoreInterface {
         let mut next = 0;
         while next < pending.len()
             && jobs.len() < NETWORK_WINDOW
-            && !control.is_cancelled()
+            && !control.should_stop()
         {
             let (id, character) = pending[next];
             let api = self.api_interface.clone();
@@ -681,7 +888,7 @@ impl ActivityStoreInterface {
             next += 1;
         }
         while !jobs.is_empty() {
-            if control.is_cancelled() {
+            if control.should_stop() {
                 jobs.abort_all();
             }
             let result = match tokio::time::timeout(
@@ -694,7 +901,7 @@ impl ActivityStoreInterface {
                 Ok(None) => break,
                 Err(_) => continue,
             };
-            if next < pending.len() && !control.is_cancelled() {
+            if next < pending.len() && !control.should_stop() {
                 let (id, character) = pending[next];
                 let api = self.api_interface.clone();
                 jobs.spawn(async move {
@@ -709,7 +916,7 @@ impl ActivityStoreInterface {
             let mut fetched = vec![result];
             while fetched.len() < WRITE_BATCH_SIZE
                 && !jobs.is_empty()
-                && !control.is_cancelled()
+                && !control.should_stop()
             {
                 match jobs.try_join_next() {
                     Some(result) => {
@@ -724,7 +931,7 @@ impl ActivityStoreInterface {
                     None => break,
                 }
             }
-            if control.is_cancelled() {
+            if control.should_stop() {
                 continue;
             }
             let written = async {

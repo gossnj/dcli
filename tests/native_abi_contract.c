@@ -20,6 +20,15 @@ static bool (*checked_close)(DcliActivityStore *) = dcli_store_close;
 
 _Static_assert(sizeof(DcliSyncEventV1) == 28, "Version 1 sync event layout changed");
 _Static_assert(offsetof(DcliSyncEventV1, flags) == 24, "Version 1 coverage flags moved");
+_Static_assert(sizeof(DcliSyncSliceOptionsV1) == 8, "Slice options layout changed");
+_Static_assert(sizeof(DcliSyncSliceResultV1) == 40, "Slice result layout changed");
+_Static_assert(offsetof(DcliSyncSliceResultV1, snapshot) == 12, "Slice snapshot moved");
+
+static bool (*sync_slice)(DcliActivityStore *, int64_t, int32_t,
+                         const DcliSyncSliceOptionsV1 *, const DcliSyncControl *,
+                         DcliSyncCallbackV1, void *, DcliSyncSliceResultV1 *) =
+    dcli_store_sync_member_slice_v1;
+
 
 static void *cancel_from_another_thread(void *control) {
     dcli_sync_control_cancel(control);
@@ -27,6 +36,11 @@ static void *cancel_from_another_thread(void *control) {
 }
 
 int main(void) {
+    DcliSyncSliceOptionsV1 options = {1, 20};
+    DcliSyncSliceResultV1 slice = {0};
+    assert(!sync_slice(NULL, 10, 3, &options, NULL, NULL, NULL, &slice));
+    assert(slice.version == 1 && slice.snapshot.version == 1 && slice.snapshot.flags == 0);
+    assert(!sync_slice(NULL, 10, 3, &options, NULL, NULL, NULL, NULL));
     DcliSyncEventV1 outcome = {0};
     assert(!dcli_store_sync_player_v1(NULL, NULL, NULL, NULL, NULL, &outcome));
     assert(outcome.version == 1 && outcome.flags == 0);

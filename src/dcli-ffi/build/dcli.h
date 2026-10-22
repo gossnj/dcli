@@ -233,4 +233,22 @@ bool dcli_store_sync_player_v1(DcliActivityStore *store, const char *bungie_name
                                const DcliSyncControl *control, DcliSyncCallbackV1 callback,
                                void *user_data, DcliSyncEventV1 *out_outcome);
 
+/** A bounded continuation. Budget zero defers without admitting API work.
+ * Dispositions: 0 deferred, 1 checkpointed, 2 full complete, 3 cancelled, 4 failed.
+ * A true return means the result is valid; full coverage requires disposition 2. */
+typedef struct DcliSyncSliceOptionsV1 {
+  uint32_t version;
+  uint32_t budget_milliseconds;
+} DcliSyncSliceOptionsV1;
+typedef struct DcliSyncSliceResultV1 {
+  uint32_t version;
+  uint32_t disposition;
+  uint32_t newly_discovered;
+  DcliSyncEventV1 snapshot;
+} DcliSyncSliceResultV1;
+bool dcli_store_sync_member_slice_v1(DcliActivityStore *store, int64_t member_id,
+                                     int32_t membership_type, const DcliSyncSliceOptionsV1 *options,
+                                     const DcliSyncControl *control, DcliSyncCallbackV1 callback,
+                                     void *user_data, DcliSyncSliceResultV1 *out_result);
+
 #endif  /* DCLI_FFI_H */
