@@ -901,7 +901,7 @@ impl ActivityStoreInterface {
                         }
                     }
                     Ok(_) => continue,
-                    Err(_) => break,
+                    Err(error) => return Err(error),
                 }
                 let anchors =
                     &streams[index].checkpoint.as_ref().unwrap().tail_raw;

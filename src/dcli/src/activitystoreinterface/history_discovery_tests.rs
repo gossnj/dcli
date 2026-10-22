@@ -200,6 +200,108 @@ async fn reopen_history_with_shift(
 }
 
 #[sqlx::test]
+async fn history_probe_failure_preserves_deep_checkpoint_for_retry() {
+    const COUNT: i64 = 10_000;
+    let fail_probe = Arc::new(AtomicBool::new(false));
+    let failing = fail_probe.clone();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let server = Server::new(move |path| {
+        if let Some(id) = pgcr_id(&path) {
+            return Reply::json(envelope(report_json(id, id as u32)));
+        }
+        if path.contains("components=") {
+            return Reply::json(profile());
+        }
+        if query(&path, "mode") == Some(32) {
+            return Reply::json(large_history(&[]));
+        }
+        let page = query(&path, "page").unwrap() as usize;
+        recorded.lock().unwrap().push(page);
+        if failing.load(Ordering::SeqCst) && page == 29 {
+            return Reply::json(json!({"ErrorCode":5,"ThrottleSeconds":0,
+                "ErrorStatus":"SystemDisabled","Message":"temporary fixture failure"}));
+        }
+        Reply::json(large_history(
+            &(1..=COUNT)
+                .rev()
+                .skip(page * 250)
+                .take(250)
+                .collect::<Vec<_>>(),
+        ))
+    });
+    let directory = TestDirectory::new();
+    let mut store = directory.open().await;
+    server.attach(&mut store);
+    let stop = SyncControl::new();
+    let partial = store
+        .sync_member_engine(&member(), &stop, &|event| {
+            if event.outcome.discovered >= 7_500 {
+                stop.cancel();
+            }
+        })
+        .await
+        .unwrap();
+    assert!(
+        partial.cancelled
+            && partial.recent_ready
+            && !partial.discovery_complete
+    );
+    let saved: (i64, i64, i64, String, String, i64) = sqlx::query_as(
+        "SELECT version,epoch,boundary,head_raw,tail_raw,page_hint FROM sync_history_resume WHERE member=10 AND character=100 AND mode=5")
+        .fetch_one(&mut store.db).await.unwrap();
+    assert_eq!(saved.5, 29);
+    store.db.close().await.unwrap();
+
+    fail_probe.store(true, Ordering::SeqCst);
+    let mut failed = directory.open().await;
+    server.attach(&mut failed);
+    let result = failed
+        .sync_member_engine(&member(), &SyncControl::new(), &|_| {})
+        .await;
+    assert!(
+        result.is_err(),
+        "a service failure must remain visible to the caller"
+    );
+    let after_failure: Option<(i64, i64, i64, String, String, i64)> = sqlx::query_as(
+        "SELECT version,epoch,boundary,head_raw,tail_raw,page_hint FROM sync_history_resume WHERE member=10 AND character=100 AND mode=5")
+        .fetch_optional(&mut failed.db).await.unwrap();
+    assert_eq!(
+        after_failure,
+        Some(saved),
+        "failed probing must preserve the deep checkpoint"
+    );
+    failed.db.close().await.unwrap();
+
+    fail_probe.store(false, Ordering::SeqCst);
+    requests.lock().unwrap().clear();
+    let mut retried = directory.open().await;
+    server.attach(&mut retried);
+    let stop = SyncControl::new();
+    let result = retried
+        .sync_member_engine(&member(), &stop, &|event| {
+            if event.outcome.discovery_complete {
+                stop.cancel();
+            }
+        })
+        .await
+        .unwrap();
+    assert!(result.discovery_complete);
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT activity_id FROM sync_history ORDER BY activity_id",
+    )
+    .fetch_all(&mut retried.db)
+    .await
+    .unwrap();
+    assert_eq!(ids, (1..=COUNT).collect::<Vec<_>>());
+    assert!(
+        requests.lock().unwrap().len() <= 24,
+        "recovery must reuse the saved deep checkpoint"
+    );
+    retried.db.close().await.unwrap();
+}
+
+#[sqlx::test]
 async fn history_reopen_resumes_committed_prefix() {
     reopen_history_with_shift(0, 0..=0, true, false, None).await;
 }
