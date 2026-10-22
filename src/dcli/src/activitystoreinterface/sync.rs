@@ -1,5 +1,6 @@
 use super::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use futures::future::{AbortHandle, Abortable};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -7,6 +8,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
+
+use crate::response::activities::Activity;
 
 pub(super) const SYNC_SCAN_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_scan (
@@ -36,6 +39,27 @@ const NETWORK_WINDOW: usize = 25;
 const WRITE_BATCH_SIZE: usize = 4;
 const QUEUE_PAGE_SIZE: i64 = 256;
 const RECENT_COUNT: usize = 50;
+const HISTORY_WINDOW: usize = 4;
+const HISTORY_STREAM_WINDOW: usize = 2;
+const PAGE_INSERT_BATCH: usize = 200;
+const RESUME_ANCHORS: usize = 8;
+const RESUME_HEAD_PAGES: i32 = 8;
+const RESUME_SEARCH_RADIUS: i32 = 8;
+
+const HISTORY_RESUME_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_history_resume (
+    member INTEGER NOT NULL,
+    character INTEGER NOT NULL,
+    mode INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    epoch INTEGER NOT NULL,
+    boundary INTEGER NOT NULL,
+    head_raw TEXT NOT NULL,
+    tail_raw TEXT NOT NULL,
+    page_hint INTEGER NOT NULL,
+    PRIMARY KEY(member, character, mode)
+);
+"#;
 
 /// A cancellation request that can be sent without borrowing the store.
 #[derive(Clone)]
@@ -161,6 +185,39 @@ struct Stream {
     page: i32,
     complete: bool,
     frontier: Option<DateTime<Utc>>,
+    epoch: i64,
+    checkpoint: Option<ResumeCheckpoint>,
+    resume_pending: bool,
+    head_raw: Vec<i64>,
+    bridge_tail: Vec<i64>,
+    head_overlap_page: Option<i32>,
+}
+
+struct ResumeCheckpoint {
+    epoch: i64,
+    head_raw: Vec<i64>,
+    tail_raw: Vec<i64>,
+    page_hint: i32,
+}
+
+fn ordered_overlap(anchors: &[i64], raw: &[i64]) -> Option<usize> {
+    let mut locations = HashMap::new();
+    for (index, id) in raw.iter().enumerate() {
+        if locations.insert(*id, index).is_some() {
+            return None;
+        }
+    }
+    let positions: Vec<_> = anchors
+        .iter()
+        .enumerate()
+        .filter_map(|(anchor, id)| {
+            locations.get(id).map(|&position| (anchor, position))
+        })
+        .collect();
+    (positions.len() >= 3
+        && positions.windows(2).all(|pair| pair[0].1 < pair[1].1)
+        && positions.windows(2).any(|pair| pair[0].0 + 1 == pair[1].0))
+    .then(|| positions.last().unwrap().1)
 }
 
 fn trim_recent(recent: &mut HashMap<i64, (DateTime<Utc>, i64)>) {
@@ -181,6 +238,69 @@ fn trim_recent(recent: &mut HashMap<i64, (DateTime<Utc>, i64)>) {
 }
 
 impl ActivityStoreInterface {
+    async fn ensure_resume_schema(&mut self) -> Result<(), Error> {
+        sqlx::query(HISTORY_RESUME_SCHEMA)
+            .execute(&mut self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn discard_resume(
+        &mut self,
+        member: i64,
+        character: i64,
+        mode: Mode,
+    ) -> Result<(), Error> {
+        sqlx::query("DELETE FROM sync_history_resume WHERE member=? AND character=? AND mode=?")
+            .bind(member).bind(character).bind(mode.as_id() as i64)
+            .execute(&mut self.db).await?;
+        Ok(())
+    }
+
+    async fn load_resume(
+        &mut self,
+        member: i64,
+        character: i64,
+        mode: Mode,
+        boundary: i64,
+    ) -> Result<Option<ResumeCheckpoint>, Error> {
+        let saved: Option<(i64, i64, i64, String, String, i64)> = sqlx::query_as(
+            "SELECT version,epoch,boundary,head_raw,tail_raw,page_hint FROM sync_history_resume WHERE member=? AND character=? AND mode=?"
+        ).bind(member).bind(character).bind(mode.as_id() as i64)
+            .fetch_optional(&mut self.db).await?;
+        let Some((version, epoch, saved_boundary, head, tail, hint)) = saved
+        else {
+            return Ok(None);
+        };
+        let parsed = serde_json::from_str::<Vec<i64>>(&head)
+            .ok()
+            .zip(serde_json::from_str::<Vec<i64>>(&tail).ok());
+        if let Some((head_raw, tail_raw)) = parsed {
+            let valid_ids = |ids: &[i64]| {
+                ids.len() >= 3
+                    && ids.len() <= RESUME_ANCHORS
+                    && ids.iter().copied().collect::<HashSet<_>>().len()
+                        == ids.len()
+            };
+            if version == 1
+                && saved_boundary == boundary
+                && hint >= 0
+                && hint <= i32::MAX as i64
+                && valid_ids(&head_raw)
+                && valid_ids(&tail_raw)
+            {
+                return Ok(Some(ResumeCheckpoint {
+                    epoch,
+                    head_raw,
+                    tail_raw,
+                    page_hint: hint as i32,
+                }));
+            }
+        }
+        self.discard_resume(member, character, mode).await?;
+        Ok(None)
+    }
+
     async fn reset_attempted(&mut self) -> Result<(), Error> {
         sqlx::query("CREATE TEMP TABLE IF NOT EXISTS sync_attempted(activity_id INTEGER PRIMARY KEY)")
             .execute(&mut self.db).await?;
@@ -385,6 +505,7 @@ impl ActivityStoreInterface {
         &mut self,
         member: i64,
     ) -> Result<(), Error> {
+        self.ensure_resume_schema().await?;
         let characters: Vec<i64> = sqlx::query_scalar(
             "SELECT character_id FROM character WHERE member=?",
         )
@@ -399,7 +520,10 @@ impl ActivityStoreInterface {
                     .fetch_optional(&mut self.db).await?;
                 let boundary = match previous {
                     Some((boundary, 0)) => boundary,
-                    _ => self.get_max_activity_id(&character, &mode).await?,
+                    _ => {
+                        self.discard_resume(member, character, mode).await?;
+                        self.get_max_activity_id(&character, &mode).await?
+                    }
                 };
                 sqlx::query("INSERT INTO sync_scan(member,character,mode,boundary,complete) VALUES (?,?,?,?,0) ON CONFLICT(member,character,mode) DO UPDATE SET boundary=excluded.boundary,complete=0")
                     .bind(member).bind(character).bind(mode.as_id() as i64).bind(boundary)
@@ -469,6 +593,7 @@ impl ActivityStoreInterface {
             return Err(Error::InvalidParameters);
         }
         self.insert_member(&profile_member).await?;
+        self.ensure_resume_schema().await?;
         let mut streams = Vec::new();
         for character in &profile.characters.characters {
             self.insert_character(&character.id, &character.class_type, member)
@@ -480,7 +605,22 @@ impl ActivityStoreInterface {
                  .fetch_optional(&mut self.db).await?;
                 let boundary = match previous {
                     Some((boundary, 0)) => boundary,
-                    _ => self.get_max_activity_id(&character.id, &mode).await?,
+                    _ => {
+                        self.discard_resume(member.id, character.id, mode)
+                            .await?;
+                        self.get_max_activity_id(&character.id, &mode).await?
+                    }
+                };
+                let checkpoint = self
+                    .load_resume(member.id, character.id, mode, boundary)
+                    .await?;
+                let epoch = match &checkpoint {
+                    Some(checkpoint) => checkpoint.epoch,
+                    None => {
+                        sqlx::query_scalar("SELECT random()")
+                            .fetch_one(&mut self.db)
+                            .await?
+                    }
                 };
                 streams.push(Stream {
                     character: character.id,
@@ -489,9 +629,16 @@ impl ActivityStoreInterface {
                     page: 0,
                     complete: false,
                     frontier: None,
+                    epoch,
+                    resume_pending: checkpoint.is_some(),
+                    checkpoint,
+                    head_raw: Vec::new(),
+                    bridge_tail: Vec::new(),
+                    head_overlap_page: None,
                 });
             }
         }
+        streams.sort_by_key(|stream| (stream.character, stream.mode.as_id()));
 
         self.begin_transaction().await?;
         let initialized = async {
@@ -512,29 +659,59 @@ impl ActivityStoreInterface {
             self.reset_attempted().await?;
         }
         self.load_existing_recent(member.id, &mut recent).await?;
-        // Establish a provisional recent set across every stream before fetching
-        // details. Further pages can still displace it at the global frontier.
-        for stream in &mut streams {
-            if control.should_stop() {
-                break;
-            }
-            self.scan_page(member, stream, control, &mut recent, &mut outcome)
-                .await?;
-            if control.should_stop() {
-                break;
-            }
-            outcome.discovered = self.discovered_count(member.id).await?;
-            self.update_outcome_coverage(member.id, &mut outcome)
-                .await?;
-            on_event(SyncEvent {
-                phase: SyncPhase::Discovering,
-                outcome,
-            });
-        }
-        outcome.discovery_complete =
-            streams.iter().all(|stream| stream.complete);
-
+        outcome.discovered = self.discovered_count(member.id).await?;
+        self.update_outcome_coverage(member.id, &mut outcome)
+            .await?;
+        let mut next_wave = 0;
         while !control.should_stop() && !outcome.recent_ready {
+            let initial_frontiers = streams
+                .iter()
+                .any(|stream| !stream.complete && stream.page == 0);
+            let cutoff = if recent.len() >= RECENT_COUNT {
+                recent.values().map(|(period, _)| *period).min()
+            } else {
+                None
+            };
+            let eligible: Vec<_> = (0..streams.len())
+                .map(|offset| (next_wave + offset) % streams.len())
+                .filter(|&index| {
+                    let stream = &streams[index];
+                    !stream.complete
+                        && (initial_frontiers && stream.page == 0
+                            || !initial_frontiers
+                                && !cutoff.is_some_and(|cutoff| {
+                                    stream
+                                        .frontier
+                                        .is_some_and(|period| period < cutoff)
+                                }))
+                })
+                .take(HISTORY_WINDOW)
+                .collect();
+            if !eligible.is_empty() {
+                self.scan_pages(
+                    member,
+                    &mut streams,
+                    &eligible,
+                    1,
+                    control,
+                    &mut recent,
+                    &mut outcome,
+                    on_event,
+                )
+                .await?;
+                next_wave = (eligible[eligible.len() - 1] + 1) % streams.len();
+            }
+            outcome.discovery_complete =
+                streams.iter().all(|stream| stream.complete);
+            if control.should_stop() {
+                break;
+            }
+            if streams
+                .iter()
+                .any(|stream| !stream.complete && stream.page == 0)
+            {
+                continue;
+            }
             self.download_recent(&recent, control, &mut outcome, on_event)
                 .await?;
             self.maybe_recent_ready(
@@ -547,85 +724,50 @@ impl ActivityStoreInterface {
             .await?;
             if outcome.recent_ready
                 || control.should_stop()
-                || streams.iter().all(|s| s.complete)
+                || eligible.is_empty()
             {
                 break;
             }
-            let cutoff = if recent.len() >= RECENT_COUNT {
-                recent.values().map(|(period, _)| *period).min()
-            } else {
-                None
-            };
-            if !streams.iter().any(|stream| {
-                !stream.complete
-                    && cutoff.map_or(true, |cutoff| {
-                        stream.frontier.map_or(true, |period| period >= cutoff)
-                    })
-            }) {
-                break;
-            }
-            for stream in &mut streams {
-                if control.should_stop() {
-                    break;
-                }
-                if stream.complete
-                    || cutoff.is_some_and(|cutoff| {
-                        stream.frontier.is_some_and(|period| period < cutoff)
-                    })
-                {
-                    continue;
-                }
-                self.scan_page(
-                    member,
-                    stream,
-                    control,
-                    &mut recent,
-                    &mut outcome,
-                )
-                .await?;
-                if control.should_stop() {
-                    break;
-                }
-                outcome.discovered = self.discovered_count(member.id).await?;
-                self.update_outcome_coverage(member.id, &mut outcome)
-                    .await?;
-                on_event(SyncEvent {
-                    phase: SyncPhase::Discovering,
-                    outcome,
-                });
-            }
         }
 
-        while !control.should_stop() && streams.iter().any(|s| !s.complete) {
-            for stream in &mut streams {
+        if !control.should_stop()
+            && streams.iter().any(|stream| !stream.complete)
+        {
+            for index in 0..streams.len() {
                 if control.should_stop() {
                     break;
                 }
-                if stream.complete {
-                    continue;
-                }
-                self.scan_page(
+                self.prepare_resume(
                     member,
-                    stream,
+                    &mut streams,
+                    index,
                     control,
                     &mut recent,
                     &mut outcome,
+                    on_event,
                 )
                 .await?;
-                if control.should_stop() {
-                    break;
-                }
-                outcome.discovered = self.discovered_count(member.id).await?;
-                self.update_outcome_coverage(member.id, &mut outcome)
-                    .await?;
-                on_event(SyncEvent {
-                    phase: SyncPhase::Discovering,
-                    outcome,
-                });
             }
+        }
+        if !control.should_stop()
+            && streams.iter().any(|stream| !stream.complete)
+        {
+            let eligible: Vec<_> = (0..streams.len()).collect();
+            self.scan_pages(
+                member,
+                &mut streams,
+                &eligible,
+                HISTORY_STREAM_WINDOW,
+                control,
+                &mut recent,
+                &mut outcome,
+                on_event,
+            )
+            .await?;
         }
 
         outcome.discovery_complete = streams.iter().all(|s| s.complete);
+        outcome.discovered = self.discovered_count(member.id).await?;
         self.update_outcome_coverage(member.id, &mut outcome)
             .await?;
         if outcome.discovery_complete && !control.should_stop() {
@@ -674,65 +816,428 @@ impl ActivityStoreInterface {
         Ok(outcome)
     }
 
-    async fn scan_page(
+    async fn prepare_resume<F>(
         &mut self,
         member: &Member,
-        stream: &mut Stream,
+        streams: &mut [Stream],
+        index: usize,
         control: &SyncControl,
         recent: &mut HashMap<i64, (DateTime<Utc>, i64)>,
         outcome: &mut SyncOutcome,
-    ) -> Result<Vec<(i64, i64)>, Error> {
-        let page = match await_or_cancel(
-            control,
-            self.api_interface.retrieve_activities(
-                &member.id,
-                &stream.character,
-                &member.platform,
-                &stream.mode,
-                HISTORY_PAGE_SIZE,
-                stream.page,
-            ),
-        )
-        .await
-        {
-            Some(result) => result?,
-            None => return Ok(Vec::new()),
-        };
-        if control.should_stop() {
-            return Ok(Vec::new());
+        on_event: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(SyncEvent),
+    {
+        if !streams[index].resume_pending || streams[index].complete {
+            return Ok(());
         }
+        while !control.should_stop()
+            && !streams[index].complete
+            && streams[index].head_overlap_page.is_none()
+            && streams[index].page < RESUME_HEAD_PAGES
+        {
+            self.scan_pages(
+                member,
+                streams,
+                &[index],
+                1,
+                control,
+                recent,
+                outcome,
+                on_event,
+            )
+            .await?;
+        }
+        if control.should_stop() || streams[index].complete {
+            return Ok(());
+        }
+        let checkpoint = streams[index].checkpoint.as_ref().unwrap();
+        let guess = streams[index]
+            .head_overlap_page
+            .and_then(|head_page| checkpoint.page_hint.checked_add(head_page));
+        if let Some(guess) = guess {
+            let mut probes: BTreeMap<i32, Vec<Activity>> = BTreeMap::new();
+            let mut probe_order = VecDeque::new();
+            for step in 0..=(RESUME_SEARCH_RADIUS * 2) {
+                if control.should_stop() {
+                    return Ok(());
+                }
+                let offset = if step == 0 {
+                    0
+                } else if step % 2 == 1 {
+                    -(step + 1) / 2
+                } else {
+                    step / 2
+                };
+                let Some(page) = guess.checked_add(offset) else {
+                    continue;
+                };
+                if page <= streams[index].page + 1 {
+                    continue;
+                }
+                let api = self.api_interface.clone();
+                let fetched = await_or_cancel(
+                    control,
+                    api.retrieve_activities(
+                        &member.id,
+                        &streams[index].character,
+                        &member.platform,
+                        &streams[index].mode,
+                        HISTORY_PAGE_SIZE,
+                        page,
+                    ),
+                )
+                .await;
+                let Some(fetched) = fetched else {
+                    return Ok(());
+                };
+                match fetched {
+                    Ok(Some(activities)) if !activities.is_empty() => {
+                        probes.insert(page, activities);
+                        probe_order.push_back(page);
+                        while probe_order.len() > 3 {
+                            probes.remove(&probe_order.pop_front().unwrap());
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(error) => return Err(error),
+                }
+                let anchors =
+                    &streams[index].checkpoint.as_ref().unwrap().tail_raw;
+                let mut landings = Vec::new();
+                for (&probe_page, activities) in &probes {
+                    let raw: Vec<_> = activities
+                        .iter()
+                        .map(|activity| activity.details.instance_id)
+                        .collect();
+                    if ordered_overlap(anchors, &raw).is_some() {
+                        landings.push(probe_page);
+                    }
+                    if let Some(next) = probes.get(&(probe_page + 1)) {
+                        let mut combined = raw;
+                        combined.extend(
+                            next.iter()
+                                .map(|activity| activity.details.instance_id),
+                        );
+                        if ordered_overlap(anchors, &combined).is_some() {
+                            landings.push(probe_page);
+                        }
+                    }
+                }
+                landings.sort_unstable();
+                landings.dedup();
+                if let Some(&landing) = landings.first() {
+                    if landings.iter().any(|&page| page > landing + 1) {
+                        break;
+                    }
+                    let activities = probes.remove(&landing).unwrap();
+                    streams[index].page = landing;
+                    streams[index].resume_pending = false;
+                    streams[index].checkpoint = None;
+                    let queue_changed = self
+                        .admit_page(
+                            member,
+                            &mut streams[index],
+                            Some(activities),
+                            recent,
+                            outcome,
+                        )
+                        .await?;
+                    if !control.should_stop() {
+                        if queue_changed {
+                            self.update_outcome_coverage(member.id, outcome)
+                                .await?;
+                        }
+                        on_event(SyncEvent {
+                            phase: SyncPhase::Discovering,
+                            outcome: *outcome,
+                        });
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if !control.should_stop() {
+            self.discard_resume(
+                member.id,
+                streams[index].character,
+                streams[index].mode,
+            )
+            .await?;
+            streams[index].checkpoint = None;
+            streams[index].resume_pending = false;
+        }
+        Ok(())
+    }
+
+    async fn scan_pages<F>(
+        &mut self,
+        member: &Member,
+        streams: &mut [Stream],
+        eligible: &[usize],
+        per_stream: usize,
+        control: &SyncControl,
+        recent: &mut HashMap<i64, (DateTime<Utc>, i64)>,
+        outcome: &mut SyncOutcome,
+        on_event: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(SyncEvent),
+    {
+        let mut jobs = JoinSet::new();
+        let mut aborts: HashMap<(usize, i32), AbortHandle> = HashMap::new();
+        let mut buffered: BTreeMap<
+            (i32, usize),
+            Result<Option<Vec<Activity>>, Error>,
+        > = BTreeMap::new();
+        let mut next_fetch: Vec<_> =
+            streams.iter().map(|stream| stream.page).collect();
+        let limit: Vec<_> = streams
+            .iter()
+            .map(|stream| {
+                if per_stream == 1 {
+                    Some(stream.page + 1)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut failure = None;
+
+        while !control.should_stop() {
+            while jobs.len() + buffered.len() < HISTORY_WINDOW {
+                let candidate = eligible
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        !streams[index].complete
+                            && limit[index]
+                                .is_none_or(|limit| next_fetch[index] < limit)
+                            && (next_fetch[index] - streams[index].page)
+                                < per_stream as i32
+                    })
+                    .min_by_key(|&index| (next_fetch[index], index));
+                let Some(index) = candidate else {
+                    break;
+                };
+                let page = next_fetch[index];
+                next_fetch[index] += 1;
+                let api = self.api_interface.clone();
+                let member_id = member.id;
+                let platform = member.platform;
+                let character = streams[index].character;
+                let mode = streams[index].mode;
+                let (abort, registration) = AbortHandle::new_pair();
+                aborts.insert((index, page), abort);
+                jobs.spawn(async move {
+                    let fetched = Abortable::new(
+                        api.retrieve_activities(
+                            &member_id,
+                            &character,
+                            &platform,
+                            &mode,
+                            HISTORY_PAGE_SIZE,
+                            page,
+                        ),
+                        registration,
+                    )
+                    .await;
+                    (index, page, fetched)
+                });
+            }
+
+            let next = eligible
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    !streams[index].complete
+                        && limit[index]
+                            .is_none_or(|limit| streams[index].page < limit)
+                })
+                .min_by_key(|&index| (streams[index].page, index));
+            let Some(index) = next else {
+                break;
+            };
+            let page = streams[index].page;
+            if let Some(fetched) = buffered.remove(&(page, index)) {
+                match fetched {
+                    Ok(activities) => {
+                        let queue_changed = match self
+                            .admit_page(
+                                member,
+                                &mut streams[index],
+                                activities,
+                                recent,
+                                outcome,
+                            )
+                            .await
+                        {
+                            Ok(changed) => changed,
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        };
+                        if streams[index].complete {
+                            buffered.retain(|&(_, stream_index), _| {
+                                stream_index != index
+                            });
+                            for (&(stream_index, _), abort) in &aborts {
+                                if stream_index == index {
+                                    abort.abort();
+                                }
+                            }
+                        }
+                        if control.should_stop() {
+                            break;
+                        }
+                        if queue_changed {
+                            if let Err(error) = self
+                                .update_outcome_coverage(member.id, outcome)
+                                .await
+                            {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                        on_event(SyncEvent {
+                            phase: SyncPhase::Discovering,
+                            outcome: *outcome,
+                        });
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+                continue;
+            }
+            if jobs.is_empty() {
+                failure = Some(Error::Unknown {
+                    description: "history page was not scheduled".into(),
+                });
+                break;
+            }
+            match tokio::time::timeout(
+                Duration::from_millis(25),
+                jobs.join_next(),
+            )
+            .await
+            {
+                Ok(Some(Ok((index, page, fetched)))) => {
+                    aborts.remove(&(index, page));
+                    if !streams[index].complete {
+                        if let Ok(result) = fetched {
+                            buffered.insert((page, index), result);
+                        }
+                    }
+                }
+                Ok(Some(Err(error))) => {
+                    failure = Some(Error::Unknown {
+                        description: error.to_string(),
+                    });
+                    break;
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+        jobs.abort_all();
+        while jobs.join_next().await.is_some() {}
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn admit_page(
+        &mut self,
+        member: &Member,
+        stream: &mut Stream,
+        page: Option<Vec<Activity>>,
+        recent: &mut HashMap<i64, (DateTime<Utc>, i64)>,
+        outcome: &mut SyncOutcome,
+    ) -> Result<bool, Error> {
         let Some(activities) = page else {
             self.finish_scan(member.id, stream).await?;
-            return Ok(Vec::new());
+            return Ok(false);
         };
         if activities.is_empty() {
             self.finish_scan(member.id, stream).await?;
-            return Ok(Vec::new());
+            return Ok(false);
         }
+        let raw: Vec<_> = activities
+            .iter()
+            .map(|activity| activity.details.instance_id)
+            .collect();
+        let head_raw = if stream.page == 0 {
+            raw.iter().take(RESUME_ANCHORS).copied().collect::<Vec<_>>()
+        } else {
+            stream.head_raw.clone()
+        };
+        let tail_raw: Vec<_> = raw
+            .iter()
+            .rev()
+            .take(RESUME_ANCHORS)
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         let mut reached_boundary = false;
-        let mut admitted_ids = Vec::new();
+        let mut accepted = Vec::new();
+        for activity in &activities {
+            if stream.boundary != 0
+                && activity.details.instance_id == stream.boundary
+            {
+                reached_boundary = true;
+                break;
+            }
+            if [2526740498, 248695599]
+                .contains(&activity.details.director_activity_hash)
+            {
+                continue;
+            }
+            accepted.push(activity);
+        }
         let mut new_ids = 0;
+        let mut new_queue_rows = 0;
         self.begin_transaction().await?;
         let admitted = async {
-            for activity in &activities {
-                let id = activity.details.instance_id;
-                if stream.boundary != 0 && id == stream.boundary {
-                    reached_boundary = true;
-                    break;
-                }
-                if [2526740498, 248695599].contains(&activity.details.director_activity_hash) {
-                    continue;
-                }
-                sqlx::query("INSERT OR IGNORE INTO activity_queue(activity_id,character) VALUES (?,?)")
-                    .bind(id).bind(stream.character).execute(&mut self.db).await?;
-                let inserted = sqlx::query("INSERT OR IGNORE INTO sync_history(member,activity_id,character,period) VALUES (?,?,?,?)")
-                    .bind(member.id).bind(id).bind(stream.character).bind(activity.period.to_rfc3339())
+            for batch in accepted.chunks(PAGE_INSERT_BATCH) {
+                let mut queue = QueryBuilder::<Sqlite>::new(
+                    "INSERT OR IGNORE INTO activity_queue(activity_id,character) ",
+                );
+                queue.push_values(batch, |mut row, activity| {
+                    row.push_bind(activity.details.instance_id)
+                        .push_bind(stream.character);
+                });
+                new_queue_rows += queue.build().execute(&mut self.db).await?.rows_affected();
+
+                let mut history = QueryBuilder::<Sqlite>::new(
+                    "INSERT OR IGNORE INTO sync_history(member,activity_id,character,period) ",
+                );
+                history.push_values(batch, |mut row, activity| {
+                    row.push_bind(member.id)
+                        .push_bind(activity.details.instance_id)
+                        .push_bind(stream.character)
+                        .push_bind(activity.period.to_rfc3339());
+                });
+                new_ids += history.build().execute(&mut self.db).await?.rows_affected() as u32;
+            }
+            if !stream.resume_pending && head_raw.len() >= 3 && tail_raw.len() >= 3
+                && !reached_boundary
+            {
+                let head = serde_json::to_string(&head_raw).map_err(|error| Error::Unknown {
+                    description: error.to_string(),
+                })?;
+                let tail = serde_json::to_string(&tail_raw).map_err(|error| Error::Unknown {
+                    description: error.to_string(),
+                })?;
+                sqlx::query("INSERT INTO sync_history_resume(member,character,mode,version,epoch,boundary,head_raw,tail_raw,page_hint) VALUES (?,?,?,1,?,?,?,?,?) ON CONFLICT(member,character,mode) DO UPDATE SET version=excluded.version,epoch=excluded.epoch,boundary=excluded.boundary,head_raw=excluded.head_raw,tail_raw=excluded.tail_raw,page_hint=excluded.page_hint")
+                    .bind(member.id).bind(stream.character).bind(stream.mode.as_id() as i64)
+                    .bind(stream.epoch).bind(stream.boundary).bind(&head).bind(&tail).bind(stream.page)
                     .execute(&mut self.db).await?;
-                new_ids += inserted.rows_affected() as u32;
-                admitted_ids.push((id, stream.character));
-                recent.entry(id).and_modify(|entry| {
-                    if activity.period > entry.0 { *entry = (activity.period, stream.character); }
-                }).or_insert((activity.period, stream.character));
             }
             self.commit_transaction().await
         }.await;
@@ -741,13 +1246,50 @@ impl ActivityStoreInterface {
             return Err(error);
         }
         outcome.newly_discovered += new_ids;
+        outcome.discovered += new_ids;
+        for activity in accepted {
+            let id = activity.details.instance_id;
+            let period = activity.period;
+            recent
+                .entry(id)
+                .and_modify(|entry| {
+                    if period > entry.0 {
+                        *entry = (period, stream.character);
+                    }
+                })
+                .or_insert((period, stream.character));
+        }
         trim_recent(recent);
+        if stream.page == 0 {
+            stream.head_raw = head_raw;
+        }
+        if stream.resume_pending {
+            let mut bridge = std::mem::take(&mut stream.bridge_tail);
+            bridge.extend(&raw);
+            if stream.head_overlap_page.is_none()
+                && ordered_overlap(
+                    &stream.checkpoint.as_ref().unwrap().head_raw,
+                    &bridge,
+                )
+                .is_some()
+            {
+                stream.head_overlap_page = Some(stream.page);
+            }
+            stream.bridge_tail = bridge
+                .into_iter()
+                .rev()
+                .take(RESUME_ANCHORS)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+        }
         stream.frontier = activities.last().map(|a| a.period);
         stream.page += 1;
         if reached_boundary {
             self.finish_scan(member.id, stream).await?;
         }
-        Ok(admitted_ids)
+        Ok(new_queue_rows > 0)
     }
 
     async fn finish_scan(
@@ -755,9 +1297,18 @@ impl ActivityStoreInterface {
         member: i64,
         stream: &mut Stream,
     ) -> Result<(), Error> {
-        sqlx::query("UPDATE sync_scan SET complete=1 WHERE member=? AND character=? AND mode=?")
-            .bind(member).bind(stream.character).bind(stream.mode.as_id() as i64)
-            .execute(&mut self.db).await?;
+        self.begin_transaction().await?;
+        let finished = async {
+            sqlx::query("UPDATE sync_scan SET complete=1 WHERE member=? AND character=? AND mode=?")
+                .bind(member).bind(stream.character).bind(stream.mode.as_id() as i64)
+                .execute(&mut self.db).await?;
+            self.discard_resume(member, stream.character, stream.mode).await?;
+            self.commit_transaction().await
+        }.await;
+        if let Err(error) = finished {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
         stream.complete = true;
         Ok(())
     }

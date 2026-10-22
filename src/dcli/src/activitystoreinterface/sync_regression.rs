@@ -1001,25 +1001,110 @@ async fn slice_new_discovery_is_useful_but_replayed_ids_are_not() {
 async fn canonical_report_rows(
     store: &mut ActivityStoreInterface,
 ) -> Vec<(String, Vec<Vec<String>>)> {
-    let mut rows = snapshot(&mut store.db).await;
-    rows.retain(|(name, _)| {
-        matches!(
-            name.as_str(),
-            "activity"
-                | "character"
-                | "member"
-                | "modes"
-                | "team_result"
-                | "weapon_result"
-                | "medal_result"
-                | "character_activity_stats"
-                | "scoreboard_result"
-        )
-    });
-    for (_, table) in &mut rows {
-        table.sort();
+    let tables = [
+        "activity",
+        "character",
+        "member",
+        "modes",
+        "team_result",
+        "weapon_result",
+        "medal_result",
+        "character_activity_stats",
+        "scoreboard_result",
+    ];
+    let generated_id_tables = [
+        "modes",
+        "team_result",
+        "weapon_result",
+        "medal_result",
+        "character_activity_stats",
+        "scoreboard_result",
+    ];
+    let child_tables = ["weapon_result", "medal_result", "scoreboard_result"];
+    let mut canonical = Vec::with_capacity(tables.len());
+
+    for table in tables {
+        let columns = sqlx::query(&format!("PRAGMA table_info(\"{}\")", table))
+            .fetch_all(&mut store.db)
+            .await
+            .unwrap();
+        let mut expressions = Vec::new();
+        for column in columns {
+            let name: String = column.get("name");
+            if name == "id" && generated_id_tables.contains(&table) {
+                continue;
+            }
+            if child_tables.contains(&table)
+                && name == "character_activity_stats"
+            {
+                expressions.push("quote(parent.\"activity\")".to_owned());
+                expressions.push("quote(parent.\"character\")".to_owned());
+            } else {
+                let quoted_name = name.replace('"', "\"\"");
+                expressions.push(format!("quote(child.\"{}\")", quoted_name));
+            }
+        }
+
+        let from = if child_tables.contains(&table) {
+            let orphans: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM \"{}\" AS child \
+                 LEFT JOIN character_activity_stats AS parent \
+                 ON child.character_activity_stats = parent.id \
+                 WHERE parent.id IS NULL",
+                table
+            ))
+            .fetch_one(&mut store.db)
+            .await
+            .unwrap();
+            assert_eq!(orphans, 0, "{} contains orphan stats references", table);
+            format!(
+                "\"{}\" AS child LEFT JOIN character_activity_stats AS parent \
+                 ON child.character_activity_stats = parent.id",
+                table
+            )
+        } else {
+            format!("\"{}\" AS child", table)
+        };
+        let query = format!("SELECT {} FROM {}", expressions.join(", "), from);
+        let rows = sqlx::query(&query)
+            .fetch_all(&mut store.db)
+            .await
+            .unwrap();
+        let mut values: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| {
+                (0..expressions.len())
+                    .map(|index| row.get::<String, _>(index))
+                    .collect()
+            })
+            .collect();
+        values.sort();
+        canonical.push((table.to_owned(), values));
     }
-    rows
+
+    canonical
+}
+
+#[sqlx::test]
+async fn canonical_reports_compare_values_and_relationships_not_insertion_order() {
+    let left_directory = TestDirectory::new();
+    let right_directory = TestDirectory::new();
+    let mut left = left_directory.open().await;
+    let mut right = right_directory.open().await;
+    seed_queue(&mut left, &[1, 2]).await;
+    seed_queue(&mut right, &[1, 2]).await;
+    left.insert_activities_batch(&mut [report(1, 1001), report(2, 1002)], &100)
+        .await.unwrap();
+    right.insert_activities_batch(&mut [report(2, 1002), report(1, 1001)], &100)
+        .await.unwrap();
+    let expected = canonical_report_rows(&mut left).await;
+    assert_eq!(expected, canonical_report_rows(&mut right).await);
+    sqlx::query("UPDATE weapon_result SET kills=99 WHERE reference_id=1001")
+        .execute(&mut right.db).await.unwrap();
+    assert_ne!(expected, canonical_report_rows(&mut right).await);
+    sqlx::query("UPDATE weapon_result SET kills=3, character_activity_stats=(SELECT id FROM character_activity_stats WHERE activity=2) WHERE reference_id=1001")
+        .execute(&mut right.db).await.unwrap();
+    assert_ne!(expected, canonical_report_rows(&mut right).await);
 }
 
 #[sqlx::test]
@@ -1225,3 +1310,6 @@ async fn external_expiration_after_slice_commit_is_not_a_clean_checkpoint() {
     assert!(result.outcome.cancelled && !result.outcome.complete);
     assert!(result.outcome.committed > 0 && result.outcome.pending > 0);
 }
+
+#[path = "history_discovery_tests.rs"]
+mod history_discovery_tests;
