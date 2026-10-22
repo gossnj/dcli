@@ -28,6 +28,7 @@ static bool (*sync_slice)(DcliActivityStore *, int64_t, int32_t,
                          const DcliSyncSliceOptionsV1 *, const DcliSyncControl *,
                          DcliSyncCallbackV1, void *, DcliSyncSliceResultV1 *) =
     dcli_store_sync_member_slice_v1;
+static uint32_t (*sync_error_code)(const DcliSyncControl *) = dcli_sync_control_error_code;
 
 
 static void *cancel_from_another_thread(void *control) {
@@ -36,6 +37,7 @@ static void *cancel_from_another_thread(void *control) {
 }
 
 int main(void) {
+    assert(sync_error_code(NULL) == 0);
     DcliSyncSliceOptionsV1 options = {1, 20};
     DcliSyncSliceResultV1 slice = {0};
     assert(!sync_slice(NULL, 10, 3, &options, NULL, NULL, NULL, &slice));
@@ -46,6 +48,11 @@ int main(void) {
     assert(outcome.version == 1 && outcome.flags == 0);
     DcliSyncControl *control = dcli_sync_control_new();
     assert(control != NULL && !dcli_sync_control_is_cancelled(control));
+    assert(sync_error_code(control) == 0);
+    assert(!sync_slice(NULL, 10, 3, &options, control, NULL, NULL, &slice));
+    assert(sync_error_code(control) == 0);
+    assert(!dcli_store_sync_player_v1(NULL, NULL, control, NULL, NULL, &outcome));
+    assert(sync_error_code(control) == 0);
     pthread_t cancelling_thread;
     assert(pthread_create(&cancelling_thread, NULL, cancel_from_another_thread, control) == 0);
     assert(pthread_join(cancelling_thread, NULL) == 0);

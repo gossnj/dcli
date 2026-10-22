@@ -4,13 +4,55 @@ use dcli::activitystoreinterface::{
 };
 use dcli::crucible::PlayerName;
 use dcli::enums::platform::Platform;
+use dcli::error::Error;
 use std::cell::Cell;
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Independent cancellation signal; retain until sync and all cancellation callers return.
 pub struct DcliSyncControl {
     control: SyncControl,
+    error_code: AtomicU32,
+}
+
+fn sync_error_code(error: &Error) -> u32 {
+    match error {
+        Error::ApiTransport | Error::ApiRequest { .. } | Error::Request => 2,
+        Error::RequestTimedOut => 3,
+        Error::ApiThrottle { .. } => 4,
+        Error::ApiHttpStatus { .. } => 5,
+        Error::ApiStatus { .. } | Error::ApiNotAvailableException => 6,
+        Error::PrivacyException => 7,
+        Error::ApiParse { .. } | Error::ApiResponseMissing => 8,
+        Error::Database { .. } => 9,
+        Error::IoError { .. }
+        | Error::IoErrorDirIsFile { .. }
+        | Error::IoFileDoesNotExist { .. }
+        | Error::ZipError { .. }
+        | Error::SystemDirectoryNotFound => 10,
+        Error::ParameterParseFailure
+        | Error::InvalidParameters
+        | Error::InvalidArgument { .. }
+        | Error::ApiKeyMissingFromRequest
+        | Error::DateTimePeriodOrder
+        | Error::MaxActivitiesRequestCountExceeded => 11,
+        Error::BungieNameNotFound
+        | Error::NoProfilesFound
+        | Error::NoCharacters
+        | Error::CharacterDoesNotExist
+        | Error::CharacterDataNotFound
+        | Error::ActivityNotFound => 12,
+        Error::ApiBodyTooLarge => 13,
+        Error::ApiUnsupportedEncoding | Error::ApiMalformedEncoding => 14,
+        _ => 1,
+    }
+}
+
+fn set_sync_error(control: *const DcliSyncControl, code: u32) {
+    if let Some(control) = unsafe { control.as_ref() } {
+        control.error_code.store(code, Ordering::Release);
+    }
 }
 
 /// Version 1 coverage snapshot. Counts refer to the requested player's sync.
@@ -114,6 +156,7 @@ pub extern "C" fn dcli_store_sync_member_slice_v1(
     user_data: *mut c_void,
     out_result: *mut DcliSyncSliceResultV1,
 ) -> bool {
+    set_sync_error(control, 0);
     if !out_result.is_null() {
         unsafe {
             *out_result = DcliSyncSliceResultV1::empty();
@@ -131,7 +174,7 @@ pub extern "C" fn dcli_store_sync_member_slice_v1(
     if options.version != 1 {
         return false;
     }
-    let control = unsafe { control.as_ref() }
+    let sync_control = unsafe { control.as_ref() }
         .map(|token| token.control.clone())
         .unwrap_or_default();
     let last = Cell::new(DcliSyncEventV1::empty());
@@ -145,7 +188,7 @@ pub extern "C" fn dcli_store_sync_member_slice_v1(
                 std::time::Duration::from_millis(
                     options.budget_milliseconds as u64,
                 ),
-                &control,
+                &sync_control,
                 |event| {
                     let event = DcliSyncEventV1::event(&event);
                     last.set(event);
@@ -180,6 +223,7 @@ pub extern "C" fn dcli_store_sync_member_slice_v1(
             true
         }
         Err(error) => {
+            set_sync_error(control, sync_error_code(&error));
             log::error!("Sync slice failed: {}", error);
             unsafe {
                 (*out_result).disposition = 4;
@@ -194,7 +238,17 @@ pub extern "C" fn dcli_store_sync_member_slice_v1(
 pub extern "C" fn dcli_sync_control_new() -> *mut DcliSyncControl {
     Box::into_raw(Box::new(DcliSyncControl {
         control: SyncControl::default(),
+        error_code: AtomicU32::new(0),
     }))
+}
+
+#[no_mangle]
+pub extern "C" fn dcli_sync_control_error_code(
+    control: *const DcliSyncControl,
+) -> u32 {
+    unsafe { control.as_ref() }
+        .map(|control| control.error_code.load(Ordering::Acquire))
+        .unwrap_or(0)
 }
 
 /// May run concurrently with sync. Null is a no-op; freeing must wait for all users.
@@ -236,6 +290,7 @@ pub extern "C" fn dcli_store_sync_player_v1(
     user_data: *mut c_void,
     out_outcome: *mut DcliSyncEventV1,
 ) -> bool {
+    set_sync_error(control, 0);
     if !out_outcome.is_null() {
         unsafe {
             *out_outcome = DcliSyncEventV1::empty();
@@ -251,14 +306,14 @@ pub extern "C" fn dcli_store_sync_player_v1(
     if !name.is_valid_bungie_name() {
         return false;
     }
-    let control = unsafe { control.as_ref() }
+    let sync_control = unsafe { control.as_ref() }
         .map(|token| token.control.clone())
         .unwrap_or_default();
     let last = Cell::new(DcliSyncEventV1::empty());
     let store = unsafe { &mut *store };
     let result = store.runtime.block_on(store.store.sync_player_with_control(
         &name,
-        &control,
+        &sync_control,
         |event| {
             let event = DcliSyncEventV1::event(&event);
             last.set(event);
@@ -280,6 +335,7 @@ pub extern "C" fn dcli_store_sync_player_v1(
             true
         }
         Err(error) => {
+            set_sync_error(control, sync_error_code(&error));
             log::error!("Sync failed: {}", error);
             false
         }
@@ -290,4 +346,87 @@ pub extern "C" fn dcli_store_sync_player_v1(
         }
     }
     success
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_categories_do_not_export_error_details() {
+        let cases = [
+            (
+                Error::Unknown {
+                    description: "private".into(),
+                },
+                1,
+            ),
+            (Error::ApiTransport, 2),
+            (Error::RequestTimedOut, 3),
+            (Error::ApiThrottle { code: 123 }, 4),
+            (Error::ApiHttpStatus { status: 503 }, 5),
+            (
+                Error::ApiStatus {
+                    description: "private".into(),
+                },
+                6,
+            ),
+            (Error::PrivacyException, 7),
+            (
+                Error::ApiParse {
+                    description: "private".into(),
+                },
+                8,
+            ),
+            (
+                Error::Database {
+                    description: "private".into(),
+                },
+                9,
+            ),
+            (
+                Error::IoError {
+                    description: "private".into(),
+                },
+                10,
+            ),
+            (Error::InvalidParameters, 11),
+            (Error::NoProfilesFound, 12),
+            (Error::ApiBodyTooLarge, 13),
+            (Error::ApiMalformedEncoding, 14),
+        ];
+        for (error, code) in cases {
+            assert_eq!(sync_error_code(&error), code);
+        }
+    }
+
+    #[test]
+    fn error_code_is_zero_for_null_and_cleared_before_each_call() {
+        assert_eq!(dcli_sync_control_error_code(std::ptr::null()), 0);
+        let control = dcli_sync_control_new();
+        assert_eq!(dcli_sync_control_error_code(control), 0);
+        set_sync_error(control, 8);
+        assert!(!dcli_store_sync_player_v1(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            control,
+            None,
+            std::ptr::null_mut(),
+            std::ptr::null_mut()
+        ));
+        assert_eq!(dcli_sync_control_error_code(control), 0);
+        set_sync_error(control, 9);
+        assert!(!dcli_store_sync_member_slice_v1(
+            std::ptr::null_mut(),
+            0,
+            0,
+            std::ptr::null(),
+            control,
+            None,
+            std::ptr::null_mut(),
+            std::ptr::null_mut()
+        ));
+        assert_eq!(dcli_sync_control_error_code(control), 0);
+        dcli_sync_control_free(control);
+    }
 }

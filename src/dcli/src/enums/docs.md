@@ -16,12 +16,7 @@ Enums are used throughout @/dcli/src/dcli for type safety and validation. They p
 
 **Key Enums**:
 
-- **mode.rs** (22555 lines): `Mode` enum with 70+ variants representing all Crucible game types. Critical methods:
-  - `from_id(u32) -> Result<Mode>`: Convert Bungie API ID to enum
-  - `as_id() -> u32`: Convert enum to API ID
-  - `is_crucible() -> bool`: Check if mode is PvP
-  - `is_private() -> bool`: Check if private match
-  - Compound modes like `AllPvP`, `AllPvPQuickplay` that aggregate multiple modes
+- **mode.rs**: `Mode` maps known Bungie activity mode IDs to named variants. `from_id()` and numeric Serde decoding preserve unrecognized IDs as `Unknown(u32)`; `as_id()` and numeric Serde encoding return the original ID. Classification helpers such as `is_crucible()` and `is_private()` use explicit known-mode lists.
 
 - **character.rs** (5353 lines): `CharacterClass` (Titan, Hunter, Warlock, Unknown) and `CharacterClassSelection` (adds LastActive and All options for queries)
 
@@ -41,19 +36,11 @@ Enums are used throughout @/dcli/src/dcli for type safety and validation. They p
 
 - **weaponsort.rs** (2158 lines): `WeaponSort` enum for sorting weapon statistics by various criteria.
 
-**Common Pattern**:
-```rust
-impl Mode {
-    pub fn from_id(id: u32) -> Result<Mode> { /* ... */ }
-    pub fn as_id(&self) -> u32 { /* ... */ }
-}
-```
-
-All enums provide bidirectional conversion between Bungie API numeric IDs and strongly-typed enum variants.
+Known numeric values map bidirectionally between Bungie IDs and named variants. `Mode::Unknown(id)` retains an unrecognized numeric ID through conversion and Serde, and displays as `Unknown mode (id)`. CLI string parsing continues to accept only the names explicitly listed by `FromStr`.
 
 ### Things to Know
 
-**Mode Enum Complexity**: The Mode enum is the most complex with 70+ variants and sophisticated logic for compound modes. Understanding this enum is critical for filtering queries correctly.
+**Unknown Mode Behavior**: Unknown numeric IDs can pass through response deserialization and serialization without being discarded. Classification helpers only recognize the modes explicitly listed in their implementations; the unknown ID itself does not imply a broader category.
 
 **Competitive Modes**: Several competitive mode variants exist: `PvPCompetitive`, `ClashCompetitive`, `CollisionCompetitive`, `RiftCompetitive`, `ShowdownCompetitive`, `SurvivalCompetitive`. These are used in conjunction with activity hash filtering for Season 25+ data.
 
@@ -63,7 +50,7 @@ All enums provide bidirectional conversion between Bungie API numeric IDs and st
 
 **Serde Integration**: Most enums derive Serialize/Deserialize for JSON compatibility with Bungie API responses. Custom deserializers handle API inconsistencies.
 
-**Error Handling**: `from_id()` methods return `Result<T, Error>` to handle unknown/invalid IDs from API. Important for forward compatibility when Bungie adds new modes/platforms.
+**Error Handling**: `Mode::from_id()` returns `Unknown(id)` for IDs without a named variant, allowing newly introduced Bungie modes to remain available to callers. Other enum conversion functions may still reject unrecognized IDs.
 
 **Mode Groups**: Modes can belong to multiple categories. Private match modes often include both the private variant and the base mode (e.g., PrivateMatchesControl includes Control mode).
 

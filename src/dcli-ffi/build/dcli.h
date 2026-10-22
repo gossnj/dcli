@@ -225,6 +225,12 @@ DcliSyncControl *dcli_sync_control_new(void);
 /** Safe to signal concurrently with sync; null is a no-op. */
 void dcli_sync_control_cancel(const DcliSyncControl *control);
 bool dcli_sync_control_is_cancelled(const DcliSyncControl *control);
+/** Last sync failure category on this token: 0 none, 1 unknown, 2 transport,
+ * 3 timeout, 4 throttled, 5 HTTP status, 6 API status, 7 privacy,
+ * 8 response parsing, 9 database, 10 filesystem, 11 invalid input,
+ * 12 player unavailable, 13 response too large, 14 response encoding.
+ * Read while the token is alive, after the owning sync call returns. */
+uint32_t dcli_sync_control_error_code(const DcliSyncControl *control);
 /** Free only after sync and all cancellation callers return. */
 void dcli_sync_control_free(DcliSyncControl *control);
 /** True means an outcome is available; inspect flag 4 for full completion.

@@ -21,7 +21,8 @@ Path: @/src/dcli-ffi
 - Each opaque API client or activity store owns the Rust state and Tokio runtime needed to bridge synchronous C calls to async dcli operations.
 - Store initialization can return a versioned JSON diagnostic report. The consuming close operation waits for activity and manifest connection workers; legacy free remains best-effort. See [src/lib.rs](src/lib.rs) and the ownership notes in [src/docs.md](src/docs.md).
 - Progress callbacks pass a temporary message, current and total values, and caller data through the C ABI. Both public headers declare the callback type and progress-aware sync functions, which are implemented in Rust.
-- The workspace builds current source. The tracked archives in [build](build) are historical and do not export `dcli_store_init_with_diagnostics` or `dcli_store_close`; rebuild before using those APIs.
+- The version-1 full and slice sync calls use the existing opaque sync-control token to expose a fixed error category through `dcli_sync_control_error_code` after the call returns. Each invocation clears the category first; the getter returns only a code, never raw error text. The version-1 result and event layouts remain unchanged. See [the sync implementation](src/sync.rs) for the mapping and [the source Noridoc](src/docs.md) for the category list and token lifetime.
+- The tracked archives in [build](build) are historical and do not include the current sync error-code getter or other source-only additions; updating headers or Rust source does not rebuild them.
 
 ### Things to Know
 
